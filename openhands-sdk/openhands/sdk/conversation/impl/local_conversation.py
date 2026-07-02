@@ -6,7 +6,7 @@ import json
 import uuid
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any, TypeGuard
+from typing import Any, TypeGuard, cast
 
 from openhands.sdk.agent.acp_agent import ACPAgent
 from openhands.sdk.agent.base import AgentBase
@@ -39,6 +39,7 @@ from openhands.sdk.event import (
     AgentErrorEvent,
     CondensationRequest,
     Event,
+    EventID,
     InterruptEvent,
     MessageEvent,
     ObservationEvent,
@@ -332,7 +333,9 @@ class LocalConversation(BaseConversation):
             # This callback runs while holding the conversation state's lock
             # (see BaseConversation.compose_callbacks usage inside `with self._state:`
             # regions), so updating state here is thread-safe.
-            self._state.events.append(e)
+            # Single chokepoint: stamps parent_id (catching any event a hook
+            # swapped in downstream of _tree_stamping) and advances HEAD.
+            self._state.append_event(e)
             # Track user MessageEvent IDs here so hook callbacks (which may
             # synthesize or alter user messages) are captured in one place.
             if isinstance(e, MessageEvent) and e.source == "user":
@@ -371,7 +374,7 @@ class LocalConversation(BaseConversation):
         # This runs on first run()/send_message() call and handles both
         # explicit hooks and plugin hooks in one place
         self._hook_processor = None
-        self._on_event = base_callback
+        self._on_event = self._tree_stamping(base_callback)
         self._on_token = (
             BaseConversation.compose_callbacks(token_callbacks)
             if token_callbacks
@@ -444,6 +447,21 @@ class LocalConversation(BaseConversation):
             conversation_tags=tags,
         )
         self.delete_on_close = delete_on_close
+
+    def _tree_stamping(
+        self, inner: ConversationCallbackType
+    ) -> ConversationCallbackType:
+        """Wrap a callback so in-flight subscribers see a lineage-bearing event.
+
+        Convenience only: the authoritative stamp is
+        ``ConversationState.append_event``, which re-stamps anything a hook swaps
+        in downstream. HEAD advances at the append site, not here.
+        """
+
+        def wrapped(event: Event) -> None:
+            inner(self._state._stamp_parent_id(event))
+
+        return cast(ConversationCallbackType, wrapped)
 
     def _recover_persisted_client_tools(
         self,
@@ -563,6 +581,7 @@ class LocalConversation(BaseConversation):
         title: str | None = None,
         tags: dict[str, str] | None = None,
         reset_metrics: bool = True,
+        from_event_id: EventID | None = None,
     ) -> "LocalConversation":
         """Deep-copy this conversation with a new ID.
 
@@ -579,10 +598,16 @@ class LocalConversation(BaseConversation):
             tags: Optional tags for the forked conversation.
             reset_metrics: If ``True`` (default), cost/token stats start
                 fresh on the fork.
+            from_event_id: If set, copy only the branch up to this event
+                (``path_to_root``) and set the fork's HEAD there. If ``None``
+                (default), copy the whole log and keep the source's HEAD.
 
         Returns:
             A new ``LocalConversation`` that shares the same event history
             but has its own identity and independent state going forward.
+
+        Raises:
+            ValueError: If ``from_event_id`` is not an event in this conversation.
         """
         fork_id = conversation_id or uuid.uuid4()
         # Always deep-copy the agent (supplied or source) so the fork owns
@@ -624,8 +649,27 @@ class LocalConversation(BaseConversation):
                 tags=tags,
             )
 
-            for event in self._state.events:
+            # Branch slice copies path_to_root(event) (root-first, re-rootable);
+            # a full fork copies the whole log and inherits the source's HEAD.
+            if from_event_id is not None:
+                if from_event_id not in self._state.events:
+                    raise ValueError(f"Unknown from_event_id: {from_event_id}")
+                source_events: list[Event] = self._state.events.path_to_root(
+                    from_event_id
+                )
+                fork_leaf: EventID | None = from_event_id
+            else:
+                source_events = list(self._state.events)
+                fork_leaf = self._state.leaf_event_id
+
+            for event in source_events:
                 fork_conv._state.events.append(_copy_event_for_fork(event))
+            fork_conv._state.leaf_event_id = fork_leaf
+            # A full fork inherits the source's empty-HEAD state; a branch slice
+            # roots HEAD at a real event (from_event_id), so it is never empty.
+            fork_conv._state.head_is_empty = (
+                self._state.head_is_empty if from_event_id is None else False
+            )
             # Full rebuild: the copied events may need property enforcement
             # (same posture as cold load).
             fork_conv._state.rebuild_view()
@@ -650,14 +694,40 @@ class LocalConversation(BaseConversation):
             if not reset_metrics:
                 fork_conv._state.stats = self._state.stats.model_copy(deep=True)
 
-            event_count = len(self._state.events)
+            event_count = len(source_events)
 
         logger.info(
             f"Forked conversation {self.id} → {fork_id} "
             f"({event_count} events copied, "
-            f"reset_metrics={reset_metrics})"
+            f"reset_metrics={reset_metrics}, "
+            f"from_event_id={from_event_id})"
         )
         return fork_conv
+
+    def navigate_to(self, event_id: EventID | None) -> None:
+        """Move the conversation HEAD within this conversation (no new fork).
+
+        Re-roots the active branch: the agent's next context becomes
+        ``path_to_root(event_id)``. All branches stay on disk — appending after
+        navigating creates a sibling; abandoned events stay in the log but drop
+        out of ``state.view``.
+
+        Args:
+            event_id: Event to make the new HEAD, or ``None`` for the empty tree.
+
+        Raises:
+            ValueError: If ``event_id`` is not ``None`` and not in this
+                conversation.
+        """
+        with self._state:
+            if event_id is not None and event_id not in self._state.events:
+                raise ValueError(f"Unknown event_id: {event_id}")
+            self._state.leaf_event_id = event_id  # autosaves base_state.json
+            # Mark an explicit empty HEAD so it is not misread as a legacy/unset
+            # leaf (which would resolve back to the last event). See
+            # ConversationState._resolve_active_leaf.
+            self._state.head_is_empty = event_id is None
+            self._state.rebuild_view()
 
     def _ensure_plugins_loaded(self) -> None:
         """Lazy load plugins and set up hooks on first use.
@@ -929,7 +999,7 @@ class LocalConversation(BaseConversation):
                 else None
             )
 
-            self._hook_processor, self._on_event = create_hook_callback(
+            self._hook_processor, raw_on_event = create_hook_callback(
                 hook_config=final_hook_config,
                 working_dir=str(self.workspace.working_dir),
                 session_id=str(self._state.id),
@@ -941,6 +1011,7 @@ class LocalConversation(BaseConversation):
                 visualizer=self._visualizer,
                 conversation_stats=self._state.stats,
             )
+            self._on_event = self._tree_stamping(raw_on_event)
             self._hook_processor.set_conversation_state(self._state)
             self._hook_processor.run_session_start()
 
@@ -1003,7 +1074,7 @@ class LocalConversation(BaseConversation):
 
         self._state.hook_config = merged_config
         self._pending_hook_config = merged_config
-        self._hook_processor, self._on_event = create_hook_callback(
+        self._hook_processor, raw_on_event = create_hook_callback(
             hook_config=merged_config,
             working_dir=str(self.workspace.working_dir),
             session_id=str(self._state.id),
@@ -1013,6 +1084,7 @@ class LocalConversation(BaseConversation):
             visualizer=self._visualizer,
             conversation_stats=self._state.stats,
         )
+        self._on_event = self._tree_stamping(raw_on_event)
         self._hook_processor.set_conversation_state(self._state)
         self._hook_processor.run_session_start()
 
@@ -1787,7 +1859,7 @@ class LocalConversation(BaseConversation):
 
                         acp_prompt_messages = [
                             event
-                            for event in self._state.events
+                            for event in self._state.active_branch()
                             if _is_acp_prompt_message(event)
                         ]
                         if last_acp_prompt_user_message_id is None:
@@ -1902,7 +1974,7 @@ class LocalConversation(BaseConversation):
                     with self._state:
                         acp_prompt_messages = [
                             event
-                            for event in self._state.events
+                            for event in self._state.active_branch()
                             if _is_acp_prompt_message(event)
                         ]
                         latest_acp_prompt_message_id = (
@@ -2000,7 +2072,7 @@ class LocalConversation(BaseConversation):
 
                     acp_prompt_messages = [
                         event
-                        for event in self._state.events
+                        for event in self._state.active_branch()
                         if _is_acp_prompt_message(event)
                     ]
                     latest_acp_prompt_message_id = (
@@ -2143,7 +2215,9 @@ class LocalConversation(BaseConversation):
         This is a non-invasive method to reject actions between run() calls.
         Also clears the agent_waiting_for_confirmation flag.
         """
-        pending_actions = ConversationState.get_unmatched_actions(self._state.events)
+        pending_actions = ConversationState.get_unmatched_actions(
+            self._state.active_branch()
+        )
 
         with self._state:
             # Always clear the agent_waiting_for_confirmation flag
@@ -2179,7 +2253,7 @@ class LocalConversation(BaseConversation):
 
         Must be called while holding ``self._state``.
         """
-        orphans = ConversationState.get_unmatched_actions(self._state.events)
+        orphans = ConversationState.get_unmatched_actions(self._state.active_branch())
         for ae in orphans:
             logger.info(
                 "Emitting synthetic error for orphaned action %s (%s)",
@@ -2415,7 +2489,9 @@ class LocalConversation(BaseConversation):
         """
         effective_llm = llm if llm is not None else self.agent.llm
         return generate_conversation_title(
-            events=self._state.events, llm=effective_llm, max_length=max_length
+            events=self._state.active_branch(),
+            llm=effective_llm,
+            max_length=max_length,
         )
 
     def condense(self) -> None:
