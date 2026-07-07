@@ -1609,6 +1609,31 @@ class LocalConversation(BaseConversation):
         with self._state:
             self._on_event(event)
 
+    @contextlib.asynccontextmanager
+    async def _released_state_lock_during_io(self):
+        """Release the run loop's state lock across an awaited LLM network call.
+
+        ``arun()`` holds the state lock across the whole step; releasing it for
+        just the network wait keeps ``send_message()`` and state snapshots
+        responsive. No-op unless this thread holds the lock, so direct ``astep``
+        calls are unaffected. Deadlock-safe: ``arun`` is the only holder across
+        an ``await``; every other holder takes it only briefly.
+        """
+        lock = self._state._lock
+        if not lock.owned():
+            yield
+            return
+        held_flag = self._step_holds_state_lock
+        depth = lock.release_all()
+        # Keep the flag honest while released so a concurrent switch_llm (on the
+        # event-loop thread) takes the now-free lock instead of racing mutators.
+        self._step_holds_state_lock = False
+        try:
+            yield
+        finally:
+            lock.reacquire(depth)
+            self._step_holds_state_lock = held_flag
+
     @observe(name="conversation.run")
     def run(self) -> None:
         """Runs the conversation until the agent finishes.
