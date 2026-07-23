@@ -140,7 +140,7 @@ Run the SDK's documented setup, format, lint, type-check, and test commands from
 
 - **Backend** — the OpenHands Agent Server, run with `uv run` over the local uv workspace in `packages/software-agent-sdk`. Workspace sources only; it never installs `openhands-*` releases from PyPI.
 - **Frontend** — the Agent Canvas Vite dev server from `packages/agent-canvas` (`npm run dev:frontend`), proxying `/api` to the local backend.
-- **Ingress** — the frontend package's own standalone reverse proxy (`packages/agent-canvas/scripts/ingress.mjs`, consumed unmodified), exposing the whole stack behind one origin (default `:9000`) so browsers on other machines never need to reach the backend port. The direct frontend (`:8000`) and backend (`:18000`) ports stay up for debugging.
+- **Ingress** — the whole stack behind one origin (default `:9000`) so browsers on other machines never need to reach the backend port. Runs via `scripts/dev-local-ingress.mjs`, a thin workspace-owned runner that reuses the upstream proxy internals (`packages/agent-canvas/scripts/proxy-utils.mjs`, consumed unmodified) and adds only a bind address. The direct frontend (`:8000`) and backend (`:18000`) ports stay up for debugging. Everything binds loopback by default: `--host` exposes the stack port, and `--expose-debug` additionally binds the debug ports to the same address.
 
 Each service runs in its own process group. If any service exits — crash or clean — the launcher stops everything else and exits with that service's status.
 
@@ -151,7 +151,7 @@ scripts/dev-local.sh --backend-only   # local agent-server + ingress
 scripts/dev-local.sh --help           # all options
 ```
 
-The flag surface mirrors the upstream `agent-canvas` CLI (`--frontend-only`, `--backend-only`, `-p/--port`), but unlike upstream it never fetches the agent-server via `uvx` from PyPI and never installs the published `@openhands/agent-canvas` package. The OpenHands Automation backend is intentionally not started: that project is not vendored in this repository. Do not "fix" the launcher by pointing it at upstream releases; it exists to exercise the local subtrees.
+The flag surface mirrors the upstream `agent-canvas` CLI (`--frontend-only`, `--backend-only`), but unlike upstream it never fetches the agent-server via `uvx` from PyPI and never installs the published `@openhands/agent-canvas` package. The OpenHands Automation backend is intentionally not started: that project is not vendored in this repository. Do not "fix" the launcher by pointing it at upstream releases; it exists to exercise the local subtrees.
 
 The launcher's requirements live in `docs/prd/1_local-dev-launcher.md`, which also serves as the reference example of the PRD format described in Modular and additive changes.
 

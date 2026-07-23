@@ -36,11 +36,11 @@ SDK_DIR="$REPO_ROOT/packages/software-agent-sdk"
 STACK_PORT=9000            # single-origin entry: ingress routes to everything
 UI_PORT=8000               # Vite dev server, direct (debug)
 BACKEND_PORT=18000         # agent-server, direct (debug); upstream default
-BACKEND_BIND_HOST="127.0.0.1"
-BACKEND_HOST=""            # host:port proxies target; derived if empty
+HOST_ADDR="127.0.0.1"      # ingress bind address (--host); loopback = private
 FRONTEND_ONLY=0
 BACKEND_ONLY=0
 NO_INGRESS=0
+EXPOSE_DEBUG=0             # 1: debug ports also bind $HOST_ADDR
 DRY_RUN=0
 
 # Extra flags for `uv run` (e.g. DEV_LOCAL_UV_FLAGS="--no-frozen").
@@ -78,14 +78,16 @@ USAGE:
 OPTIONS:
   --stack-port <port>       Single-origin entry point for the whole stack
                             (ingress; use this URL to browse)  (default: 9000)
-  -p, --port <port>         Frontend (Vite) direct port, kept for debugging
+  --frontend-port <port>    Frontend (Vite) direct port, kept for debugging
                                                               (default: 8000)
   --backend-port <port>     Agent-server direct port, kept for debugging
                                                               (default: 18000)
-  --host <addr>             Agent-server bind address    (default: 127.0.0.1)
-  --backend-host <host:port>
-                            Backend the proxies target. Only useful with
-                            --frontend-only.       (default: 127.0.0.1:18000)
+  --host <addr>             Bind address for the stack (ingress) port.
+                            Default 127.0.0.1: nothing is reachable from
+                            other machines. Set 0.0.0.0 (or a specific
+                            interface address) to expose the stack port.
+  --expose-debug            Also bind the frontend/backend debug ports to
+                            the --host address instead of loopback.
   --no-ingress              Do not start the ingress; direct ports only
   --frontend-only           Frontend dev server + ingress only
   --backend-only            Local agent-server + ingress only
@@ -100,20 +102,27 @@ ENVIRONMENT VARIABLES:
   DEV_LOCAL_UV_FLAGS        Extra flags appended to \`uv run --frozen\`.
 
 EXAMPLES:
-  scripts/dev-local.sh                       # full local stack behind :9000
+  scripts/dev-local.sh                       # full stack, loopback-only
+  scripts/dev-local.sh --host 0.0.0.0        # stack reachable at :9000
+  scripts/dev-local.sh --host 0.0.0.0 --expose-debug  # debug ports too
   scripts/dev-local.sh --stack-port 12000    # combined stack on :12000
   scripts/dev-local.sh --backend-only        # agent-server + ingress
-  scripts/dev-local.sh --frontend-only --backend-host 192.168.1.20:18000
 
 NOTES:
   - Stack (share this URL):  http://<server>:<stack-port>   single origin;
     /api, /sockets, /docs etc. route to the backend, the rest to the frontend
-  - Frontend direct (debug): http://<server>:<port>
+  - Frontend direct (debug): http://127.0.0.1:<frontend-port>
   - Backend direct (debug):  http://127.0.0.1:<backend-port>/docs
+  - Everything binds loopback by default. --host exposes the stack port
+    only; --expose-debug additionally binds the debug ports to the --host
+    address. Debug ports always work locally on the server (curl, or an
+    SSH tunnel from your machine).
+  - The proxies (ingress and Vite dev proxy) derive their backend target
+    from the launched backend's own address. With --frontend-only, they
+    expect a backend on 127.0.0.1:<backend-port> (e.g. a separate
+    --backend-only run on this machine).
   - The frontend uses same-origin API calls, so remote browsers work through
-    the stack port or the frontend port. The backend binds loopback by
-    default; reach it from other machines via those ports, or pass
-    --host 0.0.0.0 for direct access.
+    any port that serves the frontend.
   - The OpenHands Automation backend is not started (not part of this repo),
     so automation features in the UI are unavailable.
 EOF
@@ -125,26 +134,23 @@ while [ $# -gt 0 ]; do
     --frontend-only) FRONTEND_ONLY=1 ;;
     --backend-only)  BACKEND_ONLY=1 ;;
     --no-ingress)    NO_INGRESS=1 ;;
+    --expose-debug)  EXPOSE_DEBUG=1 ;;
     --stack-port)
       [ $# -ge 2 ] || { log_err "$1 requires a value"; exit 1; }
       STACK_PORT="$2"; shift ;;
     --stack-port=*) STACK_PORT="${1#*=}" ;;
-    -p|--port)
+    --frontend-port)
       [ $# -ge 2 ] || { log_err "$1 requires a value"; exit 1; }
       UI_PORT="$2"; shift ;;
-    --port=*) UI_PORT="${1#*=}" ;;
+    --frontend-port=*) UI_PORT="${1#*=}" ;;
     --backend-port)
       [ $# -ge 2 ] || { log_err "$1 requires a value"; exit 1; }
       BACKEND_PORT="$2"; shift ;;
     --backend-port=*) BACKEND_PORT="${1#*=}" ;;
     --host)
       [ $# -ge 2 ] || { log_err "$1 requires a value"; exit 1; }
-      BACKEND_BIND_HOST="$2"; shift ;;
-    --host=*) BACKEND_BIND_HOST="${1#*=}" ;;
-    --backend-host)
-      [ $# -ge 2 ] || { log_err "$1 requires a value"; exit 1; }
-      BACKEND_HOST="$2"; shift ;;
-    --backend-host=*) BACKEND_HOST="${1#*=}" ;;
+      HOST_ADDR="$2"; shift ;;
+    --host=*) HOST_ADDR="${1#*=}" ;;
     --dry-run) DRY_RUN=1 ;;
     -h|--help) usage; exit 0 ;;
     *)
@@ -159,7 +165,7 @@ if [ "$FRONTEND_ONLY" = 1 ] && [ "$BACKEND_ONLY" = 1 ]; then
   exit 1
 fi
 
-case "$UI_PORT" in *[!0-9]*|"") log_err "Invalid --port: $UI_PORT"; exit 1 ;; esac
+case "$UI_PORT" in *[!0-9]*|"") log_err "Invalid --frontend-port: $UI_PORT"; exit 1 ;; esac
 case "$BACKEND_PORT" in *[!0-9]*|"") log_err "Invalid --backend-port: $BACKEND_PORT"; exit 1 ;; esac
 case "$STACK_PORT" in *[!0-9]*|"") log_err "Invalid --stack-port: $STACK_PORT"; exit 1 ;; esac
 
@@ -167,12 +173,27 @@ LAUNCH_FRONTEND=1; [ "$BACKEND_ONLY" = 1 ] && LAUNCH_FRONTEND=0
 LAUNCH_BACKEND=1;  [ "$FRONTEND_ONLY" = 1 ] && LAUNCH_BACKEND=0
 LAUNCH_INGRESS=1;  [ "$NO_INGRESS" = 1 ] && LAUNCH_INGRESS=0
 
-# Host:port the proxies (Vite dev proxy and ingress) target. When we launch
-# the backend ourselves it is always the local one; --backend-host only
-# matters in --frontend-only mode.
-if [ -z "$BACKEND_HOST" ]; then
-  BACKEND_HOST="127.0.0.1:$BACKEND_PORT"
-fi
+# Bind addresses. --host controls the ingress only; the debug ports
+# (frontend and backend) stay on loopback unless --expose-debug, which binds
+# them to the same address as the ingress. The frontend bind is passed
+# through the dev CLI, overriding the upstream Vite config (which would
+# otherwise bind all interfaces).
+INGRESS_BIND="$HOST_ADDR"
+DEBUG_BIND="127.0.0.1"
+[ "$EXPOSE_DEBUG" = 1 ] && DEBUG_BIND="$HOST_ADDR"
+BACKEND_BIND_HOST="$DEBUG_BIND"
+FRONTEND_EXTRA_ARGS="-- --host $DEBUG_BIND"
+
+# Host:port the proxies (Vite dev proxy and ingress) target — derived from
+# the launched backend's actual bind address. Wildcard and loopback binds are
+# reached via loopback; a specific interface address is used as-is. With
+# --frontend-only no backend is launched and the same derivation applies:
+# the proxies expect a backend on this machine at $BACKEND_PORT.
+case "$BACKEND_BIND_HOST" in
+  0.0.0.0|::|127.0.0.1) BACKEND_TARGET_HOST="127.0.0.1" ;;
+  *)                    BACKEND_TARGET_HOST="$BACKEND_BIND_HOST" ;;
+esac
+BACKEND_HOST="$BACKEND_TARGET_HOST:$BACKEND_PORT"
 BACKEND_URL="http://$BACKEND_HOST"
 
 # Where the ingress sends everything that is not a backend path.
@@ -214,13 +235,16 @@ fi
 # uv-workspace members — this is what guarantees local sources, in contrast
 # to the upstream CLI's `uvx --from openhands-agent-server==<release>`.
 BACKEND_CMD="uv run $UV_FLAGS agent-server --host $BACKEND_BIND_HOST --port $BACKEND_PORT"
-FRONTEND_CMD="npm run dev:frontend"
+FRONTEND_CMD="npm run dev:frontend${FRONTEND_EXTRA_ARGS:+ $FRONTEND_EXTRA_ARGS}"
 
-# The ingress is the repo's own standalone reverse proxy (an upstream file,
-# consumed unmodified). It unifies the stack behind one origin so browsers on
-# other machines never need to reach the backend port directly.
+# The ingress unifies the stack behind one origin so browsers on other
+# machines never need to reach the backend port directly. It runs through a
+# thin workspace wrapper (dev-local-ingress.mjs) that reuses the upstream
+# proxy internals unmodified and adds only a bind address, since the
+# upstream ingress always listens on all interfaces.
+INGRESS_WRAPPER="$SCRIPT_DIR/dev-local-ingress.mjs"
 build_ingress_args() {
-  set -- --port "$STACK_PORT"
+  set -- --port "$STACK_PORT" --host "$INGRESS_BIND"
   local _route
   for _route in $BACKEND_ROUTES; do
     set -- "$@" --route "$_route=$BACKEND_URL"
@@ -229,7 +253,7 @@ build_ingress_args() {
   printf '%s ' "$@"
 }
 INGRESS_ARGS="$(build_ingress_args)"
-INGRESS_CMD="node scripts/ingress.mjs $INGRESS_ARGS"
+INGRESS_CMD="node $INGRESS_WRAPPER $INGRESS_ARGS"
 
 MODE="full stack"
 [ "$FRONTEND_ONLY" = 1 ] && MODE="frontend only"
@@ -239,6 +263,9 @@ MODE="full stack"
 if [ "$DRY_RUN" = 1 ]; then
   echo "mode:            $MODE"
   echo "repo root:       $REPO_ROOT"
+  echo "stack bind:      $INGRESS_BIND"
+  echo "debug bind:      $DEBUG_BIND"
+  echo "proxy target:    $BACKEND_URL"
   [ "$LAUNCH_BACKEND" = 1 ] && {
     echo "backend cwd:     $SDK_DIR"
     echo "backend cmd:     $BACKEND_CMD"
@@ -252,10 +279,10 @@ if [ "$DRY_RUN" = 1 ]; then
   [ "$LAUNCH_INGRESS" = 1 ] && {
     echo "ingress cwd:     $CANVAS_DIR"
     echo "ingress cmd:     $INGRESS_CMD"
-    echo "stack url:       http://localhost:$STACK_PORT"
+    echo "stack url:       http://127.0.0.1:$STACK_PORT"
   }
-  [ "$LAUNCH_FRONTEND" = 1 ] && echo "ui url (debug):  http://localhost:$UI_PORT"
-  [ "$LAUNCH_BACKEND" = 1 ] && echo "api url (debug): http://127.0.0.1:$BACKEND_PORT/docs"
+  [ "$LAUNCH_FRONTEND" = 1 ] && echo "ui url (debug):  http://127.0.0.1:$UI_PORT"
+  [ "$LAUNCH_BACKEND" = 1 ] && echo "api url (debug): $BACKEND_URL/docs"
   exit 0
 fi
 
@@ -280,10 +307,14 @@ if [ "$LAUNCH_FRONTEND" = 1 ] || [ "$LAUNCH_INGRESS" = 1 ]; then
     exit 1
   fi
 fi
-if [ "$LAUNCH_INGRESS" = 1 ] && [ ! -f "$CANVAS_DIR/scripts/ingress.mjs" ]; then
-  log_err "Ingress script not found at packages/agent-canvas/scripts/ingress.mjs."
-  log_err "Use --no-ingress or update the agent-canvas subtree."
-  exit 1
+if [ "$LAUNCH_INGRESS" = 1 ]; then
+  [ -f "$INGRESS_WRAPPER" ] || {
+    log_err "Ingress wrapper not found at $INGRESS_WRAPPER."; exit 1; }
+  [ -f "$CANVAS_DIR/scripts/proxy-utils.mjs" ] || {
+    log_err "Upstream proxy internals not found at packages/agent-canvas/scripts/proxy-utils.mjs."
+    log_err "Use --no-ingress or update the agent-canvas subtree."
+    exit 1
+  }
 fi
 
 port_in_use() {
@@ -291,7 +322,7 @@ port_in_use() {
   lsof -nP -iTCP:"$1" -sTCP:LISTEN -t >/dev/null 2>&1
 }
 [ "$LAUNCH_FRONTEND" = 1 ] && port_in_use "$UI_PORT" && {
-  log_err "Port $UI_PORT is already in use (frontend). Use --port."; exit 1; }
+  log_err "Port $UI_PORT is already in use (frontend). Use --frontend-port."; exit 1; }
 [ "$LAUNCH_BACKEND" = 1 ] && port_in_use "$BACKEND_PORT" && {
   log_err "Port $BACKEND_PORT is already in use (backend). Use --backend-port."; exit 1; }
 [ "$LAUNCH_INGRESS" = 1 ] && port_in_use "$STACK_PORT" && {
@@ -344,7 +375,8 @@ start_frontend() {
     # proxy forward to the backend — required for remote clients.
     export VITE_BACKEND_HOST="$BACKEND_HOST"
     export VITE_SESSION_API_KEY="$API_KEY"
-    npm run dev:frontend 2>&1 | prefix_logs frontend "$C_CYAN"
+    # shellcheck disable=SC2086  # FRONTEND_EXTRA_ARGS is intentionally split
+    npm run dev:frontend $FRONTEND_EXTRA_ARGS 2>&1 | prefix_logs frontend "$C_CYAN"
   ) &
   FRONTEND_PID=$!
   log "frontend starting (pid $FRONTEND_PID): $FRONTEND_CMD"
@@ -355,7 +387,7 @@ start_ingress() {
     set -o pipefail
     cd "$CANVAS_DIR" || exit 1
     # shellcheck disable=SC2086  # INGRESS_ARGS is intentionally word-split
-    node scripts/ingress.mjs $INGRESS_ARGS 2>&1 | prefix_logs ingress "$C_GREEN"
+    node "$INGRESS_WRAPPER" $INGRESS_ARGS 2>&1 | prefix_logs ingress "$C_GREEN"
   ) &
   INGRESS_PID=$!
   log "ingress  starting (pid $INGRESS_PID): $INGRESS_CMD"
@@ -411,11 +443,17 @@ log "api key: $KEY_SOURCE"
 set +m
 
 echo ""
-[ "$LAUNCH_INGRESS" = 1 ] && log_ok "Stack (once ready, single origin): http://localhost:$STACK_PORT"
-[ "$LAUNCH_FRONTEND" = 1 ] && log_ok "Frontend direct (debug):           http://localhost:$UI_PORT"
-[ "$LAUNCH_BACKEND" = 1 ] && log_ok "Backend direct (debug):            http://127.0.0.1:$BACKEND_PORT/docs"
+[ "$LAUNCH_INGRESS" = 1 ] && log_ok "Stack (once ready, single origin): http://127.0.0.1:$STACK_PORT (bound to $INGRESS_BIND)"
+[ "$LAUNCH_FRONTEND" = 1 ] && log_ok "Frontend direct (debug):           http://127.0.0.1:$UI_PORT (bound to $DEBUG_BIND)"
+[ "$LAUNCH_BACKEND" = 1 ] && log_ok "Backend direct (debug):            http://$BACKEND_HOST/docs (bound to $DEBUG_BIND)"
 [ "$LAUNCH_BACKEND" = 0 ] && \
-  log "proxies target http://$BACKEND_HOST (start a backend there)"
+  log "proxies target $BACKEND_URL (start a backend there)"
+if [ "$LAUNCH_INGRESS" = 1 ] && [ "$INGRESS_BIND" = "127.0.0.1" ]; then
+  log "stack is loopback-only; pass --host 0.0.0.0 to reach it from other machines"
+fi
+if [ "$LAUNCH_INGRESS" = 0 ] && [ "$EXPOSE_DEBUG" = 0 ]; then
+  log "note: --no-ingress without --expose-debug means nothing is reachable from other machines (--host only affects the ingress)"
+fi
 echo ""
 
 # ── Monitor: first service to exit takes the whole stack down ────────────────
@@ -427,9 +465,9 @@ check_ready() {
   [ "$BACKEND_READY" = 1 ] && return 0
   command -v curl >/dev/null 2>&1 || { BACKEND_READY=1; return 0; }
   if curl -fsS -m 2 -H "X-Session-API-Key: $API_KEY" \
-      "http://127.0.0.1:$BACKEND_PORT/health" >/dev/null 2>&1; then
+      "$BACKEND_URL/health" >/dev/null 2>&1; then
     BACKEND_READY=1
-    log_ok "backend ready at http://127.0.0.1:$BACKEND_PORT"
+    log_ok "backend ready at $BACKEND_URL"
   fi
 }
 
