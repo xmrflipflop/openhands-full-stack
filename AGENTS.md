@@ -140,13 +140,14 @@ Run the SDK's documented setup, format, lint, type-check, and test commands from
 
 - **Backend** — the OpenHands Agent Server, run with `uv run` over the local uv workspace in `packages/software-agent-sdk`. Workspace sources only; it never installs `openhands-*` releases from PyPI.
 - **Frontend** — the Agent Canvas Vite dev server from `packages/agent-canvas` (`npm run dev:frontend`), proxying `/api` to the local backend.
+- **Ingress** — the frontend package's own standalone reverse proxy (`packages/agent-canvas/scripts/ingress.mjs`, consumed unmodified), exposing the whole stack behind one origin (default `:9000`) so browsers on other machines never need to reach the backend port. The direct frontend (`:8000`) and backend (`:18000`) ports stay up for debugging.
 
 Each service runs in its own process group. If any service exits — crash or clean — the launcher stops everything else and exits with that service's status.
 
 ```sh
-scripts/dev-local.sh                  # frontend + backend
-scripts/dev-local.sh --frontend-only  # Vite dev server only
-scripts/dev-local.sh --backend-only   # local agent-server only
+scripts/dev-local.sh                  # frontend + backend + ingress
+scripts/dev-local.sh --frontend-only  # Vite dev server + ingress
+scripts/dev-local.sh --backend-only   # local agent-server + ingress
 scripts/dev-local.sh --help           # all options
 ```
 
