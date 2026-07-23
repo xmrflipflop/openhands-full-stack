@@ -71,7 +71,7 @@ When adding or changing functionality, use the first workable option:
 1. **Workspace-owned code.** Put integration code, launchers, glue, wrappers, and configuration in workspace directories (`scripts/`, `docker/`, `infra/`, `docs/`, `.github/`). Code outside `packages/` can never conflict with an upstream merge.
 2. **Upstream extension points.** Configure rather than patch. Both packages expose deliberate seams: environment variables (`OH_AGENT_SERVER_LOCAL_PATH`, `VITE_BACKEND_HOST`, `OH_SESSION_API_KEYS_0`, ...), CLI flags (`--host`, `--port`), config files (`packages/agent-canvas/config/defaults.json`), and documented plugin, hook, and adapter APIs. Drive them from workspace-owned scripts or env files.
 3. **Additive files inside a package.** If code must live inside a package, add new files or modules rather than editing existing ones, and keep the import surface into upstream files as small as possible. New files rarely conflict on merge; edited ones almost always do.
-4. **Surgical edits to upstream files (last resort).** Keep the edit minimal and isolated to the fewest possible lines. Mark every such edit with a `WORKSPACE-PATCH(docs/prd/<slug>.md):` comment pointing at the PRD that owns it, so conflicting code can be traced back to its requirements without searching.
+4. **Surgical edits to upstream files (last resort).** Keep the edit minimal and isolated to the fewest possible lines. Mark every such edit with a `WORKSPACE-PATCH(docs/prd/<number>_<slug>.md):` comment pointing at the PRD that owns it, so conflicting code can be traced back to its requirements without searching.
 
 ### Rules that keep upstream merges cheap
 
@@ -85,7 +85,7 @@ When adding or changing functionality, use the first workable option:
 
 ### Document every functionality as a PRD under `docs/prd/`
 
-Every workspace functionality — anything this repository adds on top of the upstream packages, and especially anything that modifies code inside `packages/` — must have its own PRD file at `docs/prd/<slug>.md`. One functionality per file (e.g. `docs/prd/local-dev-launcher.md`); do not batch unrelated changes into a shared document. Create or update the PRD in the same change that introduces or alters the functionality.
+Every workspace functionality — anything this repository adds on top of the upstream packages, and especially anything that modifies code inside `packages/` — must have its own PRD file at `docs/prd/<number>_<slug>.md`. One functionality per file (e.g. `docs/prd/1_local-dev-launcher.md`); do not batch unrelated changes into a shared document. Create or update the PRD in the same change that introduces or alters the functionality.
 
 Write PRDs from a requirements perspective, at a level high enough to survive refactors and upstream churn. Describe intent, behavior, and constraints. Never include line numbers, diffs, or code snippets — file paths and module names are the finest granularity allowed; anything finer goes stale with the next code change.
 
@@ -152,7 +152,7 @@ scripts/dev-local.sh --help           # all options
 
 The flag surface mirrors the upstream `agent-canvas` CLI (`--frontend-only`, `--backend-only`, `-p/--port`), but unlike upstream it never fetches the agent-server via `uvx` from PyPI and never installs the published `@openhands/agent-canvas` package. The OpenHands Automation backend is intentionally not started: that project is not vendored in this repository. Do not "fix" the launcher by pointing it at upstream releases; it exists to exercise the local subtrees.
 
-The launcher's requirements live in `docs/prd/local-dev-launcher.md`, which also serves as the reference example of the PRD format described in Modular and additive changes.
+The launcher's requirements live in `docs/prd/1_local-dev-launcher.md`, which also serves as the reference example of the PRD format described in Modular and additive changes.
 
 ## Validation
 
