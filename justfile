@@ -42,7 +42,8 @@ sync-subtree name ref="latest":
     fi
     echo "Syncing {{name}} at $ref"
     git fetch "{{name}}" --tags
-    git subtree pull --prefix="packages/{{name}}" "{{name}}" "$ref"
+    git subtree pull --prefix="packages/{{name}}" "{{name}}" "$ref" --squash \
+        -m "chore: sync {{name}} to $ref"
 
 # Sync the software-agent-sdk subtree
 sync-sdk ref="latest": (sync-subtree "software-agent-sdk" ref)
