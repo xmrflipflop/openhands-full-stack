@@ -9,7 +9,9 @@
  * stack port loopback-only by default.
  *
  * If upstream's ingress ever grows a bind-address option, retire this file
- * and call it directly. See docs/prd/local-dev-launcher.md.
+ * and call it directly.
+ *
+ * PRD: docs/prd/1_local-dev-launcher.md
  *
  * Usage:
  *   node scripts/dev-local-ingress.mjs \
