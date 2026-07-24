@@ -43,10 +43,9 @@ sync-subtree name ref="latest":
     if [[ "$ref" == "latest" ]]; then
         ref=$(curl -fsSL "https://api.github.com/repos/OpenHands/{{name}}/releases/latest" | jq -er '.tag_name')
     fi
-    echo "Syncing {{name}} at $ref"
 
     git fetch --no-tags "{{name}}" "refs/tags/$ref"
-    git subtree pull --prefix="packages/{{name}}" "{{name}}" FETCH_HEAD \
+    git subtree merge --prefix="packages/{{name}}" FETCH_HEAD \
         -m "chore: sync {{name}} to $ref"
 
 # Sync the software-agent-sdk subtree
