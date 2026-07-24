@@ -33,13 +33,25 @@ setup-remotes:
     git remote -v
 
 [private]
-sync-canvas ref="main":
-    git fetch agent-canvas
+sync-canvas ref="latest":
+    ref := if ref == "latest" {
+      `curl -fsSL https://api.github.com/repos/OpenHands/agent-canvas/releases/latest | jq -er '.tag_name'`
+    } else {
+      ref
+    }
+    echo "Syncing agent-canvas at {{ref}}"
+    git fetch agent-canvas --tags
     git subtree pull --prefix=packages/agent-canvas agent-canvas {{ref}}
 
 [private]
-sync-sdk ref="main":
-    git fetch software-agent-sdk
+sync-sdk ref="latest":
+    ref := if ref == "latest" {
+      `curl -fsSL https://api.github.com/repos/OpenHands/software-agent-sdk/releases/latest | jq -er '.tag_name'`
+    } else {
+      ref
+    }
+    echo "Syncing software-agent-sdk at {{ref}}"
+    git fetch software-agent-sdk --tags
     git subtree pull --prefix=packages/software-agent-sdk software-agent-sdk {{ref}}
 
 # Sync subtree packages from upstream
