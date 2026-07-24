@@ -30,19 +30,23 @@ lint *args:
 setup-remotes:
     git remote add agent-canvas https://github.com/OpenHands/agent-canvas.git || git remote set-url agent-canvas https://github.com/OpenHands/agent-canvas.git
     git remote add software-agent-sdk https://github.com/OpenHands/software-agent-sdk.git || git remote set-url software-agent-sdk https://github.com/OpenHands/software-agent-sdk.git
+    git config remote.software-agent-sdk.tagOpt --no-tags
+    git config remote.agent-canvas.tagOpt --no-tags
     git remote -v
 
 [private]
 sync-subtree name ref="latest":
     #!/usr/bin/env bash
-    set -euo pipefail
+    set -euxo pipefail
+
     ref="{{ref}}"
     if [[ "$ref" == "latest" ]]; then
         ref=$(curl -fsSL "https://api.github.com/repos/OpenHands/{{name}}/releases/latest" | jq -er '.tag_name')
     fi
     echo "Syncing {{name}} at $ref"
-    git fetch "{{name}}" --tags
-    git subtree pull --prefix="packages/{{name}}" "{{name}}" "$ref" --squash \
+
+    git fetch --no-tags "{{name}}" "refs/tags/$ref"
+    git subtree pull --prefix="packages/{{name}}" "{{name}}" FETCH_HEAD --squash \
         -m "chore: sync {{name}} to $ref"
 
 # Sync the software-agent-sdk subtree
