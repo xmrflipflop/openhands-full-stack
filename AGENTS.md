@@ -192,7 +192,7 @@ Before declaring work complete:
 2. Run the narrowest relevant formatter, linter, type check, build, and test command documented by the affected package.
 3. For subtree updates, validate the updated package and any affected workspace integration.
 4. Confirm the change follows the Modular and additive changes rules and that its PRD under `docs/prd/` is created or updated in the same change.
-5. Run `just check` (at minimum `just lint`, which includes `scripts/check-prd-refs.sh`) to verify workspace health and that no documentation reference has drifted.
+5. Run `just check` (at minimum `just lint`) to verify workspace health and that no documentation reference has drifted.
 6. Report the commands run, their results, and checks that could not be run.
 
 ## Subtree maintenance
