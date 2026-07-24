@@ -21,6 +21,8 @@
 #
 # Compatible with the stock macOS bash 3.2 as well as bash 4/5 on Linux.
 #
+# PRD: docs/prd/1_local-dev-launcher.md
+#
 # Usage: scripts/dev-local.sh [options]        (see --help)
 
 set -u

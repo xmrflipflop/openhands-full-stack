@@ -19,6 +19,7 @@ This repository is an integration workspace for two canonical OpenHands projects
 .
 ├── AGENTS.md
 ├── README.md
+├── justfile                       # Workspace task runner (just)
 ├── .github/
 │   └── workflows/                 # Workspace CI/CD workflows
 ├── packages/
@@ -37,6 +38,7 @@ This repository is an integration workspace for two canonical OpenHands projects
 
 | Path | Ownership and purpose |
 | --- | --- |
+| `justfile` | Workspace task entry points (`just`): wrappers over `scripts/` and workspace shortcuts |
 | `packages/agent-canvas/` | Imported Git subtree from `OpenHands/agent-canvas` |
 | `packages/software-agent-sdk/` | Imported Git subtree from `OpenHands/software-agent-sdk` |
 | `docker/Dockerfile` | Workspace container image definition |
@@ -85,7 +87,7 @@ When adding or changing functionality, use the first workable option:
 
 ### Document every functionality as a PRD under `docs/prd/`
 
-Every workspace functionality — anything this repository adds on top of the upstream packages, and especially anything that modifies code inside `packages/` — must have its own PRD file at `docs/prd/<number>_<slug>.md`. One functionality per file (e.g. `docs/prd/1_local-dev-launcher.md`); do not batch unrelated changes into a shared document. Create or update the PRD in the same change that introduces or alters the functionality.
+Every workspace functionality — anything this repository adds on top of the upstream packages, and especially anything that modifies code inside `packages/` — must have its own PRD file at `docs/prd/<number>_<slug>.md`. One functionality per file (e.g. `docs/prd/1_local-dev-launcher.md`); do not batch unrelated changes into a shared document. A new PRD takes the next unused number; numbers are unique and never reused, even after a PRD is retired. Create or update the PRD in the same change that introduces or alters the functionality.
 
 Write PRDs from a requirements perspective, at a level high enough to survive refactors and upstream churn. Describe intent, behavior, and constraints. Never include line numbers, diffs, or code snippets — file paths and module names are the finest granularity allowed; anything finer goes stale with the next code change.
 
@@ -102,6 +104,15 @@ Each PRD must contain:
 - **Status** — active, superseded (naming the successor PRD), or retired (absorbed upstream or removed).
 
 When a `git subtree pull` or rebase conflicts, resolve from requirements, not from the old diff: find the PRDs whose Scope covers the conflicting paths, re-check their Assumptions against the new upstream code, and re-apply the Functional requirements on top of it. The previous implementation is disposable; the requirements are not. After resolving, update the PRD if decisions or assumptions changed.
+
+### Keeping PRDs and the tree from drifting
+
+File references rot when files move; requirements do not. Handle the mismatch with these rules:
+
+- **Links are bidirectional, and the code side is authoritative for location.** Every workspace-owned file carries a `PRD: docs/prd/<number>_<slug>.md` header comment; edits inside `packages/` carry `WORKSPACE-PATCH(docs/prd/<number>_<slug>.md)` markers. When a file moves, its marker moves with it, so no rename can orphan a requirement.
+- **PRD numbers and slugs are stable identifiers.** Never rename a PRD file: mark it superseded (naming the successor) and create the new one under the next unused number. Everything may point at a PRD filename forever.
+- **Paths appear in exactly one place per PRD.** Repository paths belong only in the Scope table; everywhere else refer to components by role ("the launcher", "the ingress runner"). A file move then touches one table row, and prose never rots.
+- **Drift is checked mechanically, not by discipline.** `scripts/check-prd-refs.sh` validates both directions: every path an active PRD references exists, every PRD referenced from code exists, and every marker names its PRD. Run it in the Validation step and in CI so a rename fails immediately, while the author still has the context to fix it.
 
 ## Package development
 
@@ -134,6 +145,24 @@ cat packages/software-agent-sdk/README.md
 
 Run the SDK's documented setup, format, lint, type-check, and test commands from within `packages/software-agent-sdk`.
 
+## Workspace commands
+
+Workspace-level tasks are run with `just` (https://github.com/casey/just) from the repository root. Running `just` with no arguments lists every recipe; that listing, not this document, is the authoritative catalogue. The stable command names:
+
+- `just dev [flags]` — start the local stack; flags pass through to the launcher unchanged (e.g. `just dev --host 0.0.0.0`).
+- `just lint` — workspace linters, including the PRD reference check.
+- `just test` — workspace tests.
+- `just check` — `lint` + `test`; run before declaring work complete.
+- `just setup-remotes` — set up or repair the canonical upstream git remotes (idempotent).
+- `just sync` — pull both upstream subtrees from `main`. The private per-package recipes `sync-canvas` and `sync-sdk` are hidden from the listing but callable directly with an optional ref (e.g. `just sync-canvas feat/x`).
+
+Rules for the justfile:
+
+- Recipes are wrappers or shortcuts, not implementations. A recipe either invokes a workspace script, or inlines a short, linear command sequence worth memorising — e.g. the `git subtree` sync commands from Subtree maintenance. Anything with real logic (branching, parsing, error handling) belongs in `scripts/`.
+- Script-backed recipes stay thin, and every wrapped script remains directly runnable without `just`, so the justfile never becomes load-bearing.
+- When adding a workspace script or a repeated workflow, add or extend a recipe in the same change.
+- The justfile covers workspace-level tasks only. Run package-level commands (npm, uv, pytest) inside the affected package as that package documents — do not wrap upstream package tooling wholesale.
+
 ## Local development launcher
 
 `scripts/dev-local.sh` starts the full stack strictly from the code in this repository:
@@ -145,10 +174,10 @@ Run the SDK's documented setup, format, lint, type-check, and test commands from
 Each service runs in its own process group. If any service exits — crash or clean — the launcher stops everything else and exits with that service's status.
 
 ```sh
-scripts/dev-local.sh                  # frontend + backend + ingress
-scripts/dev-local.sh --frontend-only  # Vite dev server + ingress
-scripts/dev-local.sh --backend-only   # local agent-server + ingress
-scripts/dev-local.sh --help           # all options
+just dev                              # frontend + backend + ingress
+just dev --frontend-only              # Vite dev server + ingress
+just dev --backend-only               # local agent-server + ingress
+scripts/dev-local.sh --help           # all options (or: just dev --help)
 ```
 
 The flag surface mirrors the upstream `agent-canvas` CLI (`--frontend-only`, `--backend-only`), but unlike upstream it never fetches the agent-server via `uvx` from PyPI and never installs the published `@openhands/agent-canvas` package. The OpenHands Automation backend is intentionally not started: that project is not vendored in this repository. Do not "fix" the launcher by pointing it at upstream releases; it exists to exercise the local subtrees.
@@ -163,7 +192,8 @@ Before declaring work complete:
 2. Run the narrowest relevant formatter, linter, type check, build, and test command documented by the affected package.
 3. For subtree updates, validate the updated package and any affected workspace integration.
 4. Confirm the change follows the Modular and additive changes rules and that its PRD under `docs/prd/` is created or updated in the same change.
-5. Report the commands run, their results, and checks that could not be run.
+5. Run `just check` (at minimum `just lint`) to verify workspace health and that no documentation reference has drifted.
+6. Report the commands run, their results, and checks that could not be run.
 
 ## Subtree maintenance
 
@@ -174,10 +204,10 @@ Keep the remote names and local prefixes stable.
 | `OpenHands/agent-canvas` | `agent-canvas` | `packages/agent-canvas` |
 | `OpenHands/software-agent-sdk` | `software-agent-sdk` | `packages/software-agent-sdk` |
 
-Verify remotes:
+Set up or verify remotes (idempotent; prints the configured remotes):
 
 ```bash
-git remote -v
+just setup-remotes
 ```
 
 Confirm upstream default branches before pulling updates:
@@ -188,6 +218,14 @@ git ls-remote --symref software-agent-sdk HEAD
 ```
 
 Pull canonical upstream changes with the matching prefix:
+
+```bash
+just sync                 # both subtrees, from upstream main
+just sync-canvas <ref>    # one package or a non-main ref
+just sync-sdk <ref>
+```
+
+These wrap the standard subtree pulls, which remain the underlying mechanism (run them directly if the recipes are unavailable):
 
 ```bash
 git fetch agent-canvas
