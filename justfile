@@ -16,7 +16,11 @@ dev *args:
     PM2_HOME=/tmp/pm2-fg-openhands-dev pm2-runtime start ecosystem.config.js {{args}}
 
 # Bootstrap dependencies the ecosystem expects (run once per checkout).
+# Allocates the per-checkout `.dev-id` first so the dev stack can derive a
+# unique app-name tag and port block (idempotent; supports git worktrees).
+# See docs/prd/5_devid-worktree-allocation.md.
 setup:
+    ./scripts/alloc-dev-id.sh
     cd packages/software-agent-sdk && uv sync
     cd packages/agent-canvas && npm install
 
