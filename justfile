@@ -57,7 +57,6 @@ sync-canvas ref="latest": (sync-subtree "agent-canvas" ref)
 # Sync subtree packages from upstream
 sync: sync-canvas sync-sdk
 
-# Install systemd service files
-install-service:
-  @echo Installing service files
-  # TODO
+# Install/enable/start the openhands systemd USER service (no sudo; pass --help)
+install-service *args:
+  ./scripts/install-service/install.sh {{args}}

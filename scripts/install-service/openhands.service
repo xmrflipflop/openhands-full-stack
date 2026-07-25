@@ -1,0 +1,56 @@
+# openhands.service — systemd USER unit for the openhands-full-stack local stack.
+#
+# Runs the workspace's local full-stack launcher (the same thing `just dev`
+# runs: scripts/dev-local.sh) as a per-user systemd service, installed under
+# the current user's user-manager config (~/.config/systemd/user/). It is
+# installed by scripts/install-service/install.sh, which substitutes the
+# repository-clone path into the %OPENHANDS_REPO_ROOT% placeholder below.
+#
+# PRD: docs/prd/4_systemd-service-install.md
+#
+# Notes:
+# - This is a USER unit. It runs as the owning user (no root/sudo, no User= or
+#   Group= directive): the user manager already runs as that user.
+# - The command runs scripts/dev-local.sh directly with an absolute path so the
+#   service does not depend on `just` being on the service user's PATH. Running
+#   `just dev` from the repo root is the documented equivalent.
+# - Restart=on-failure brings the stack back after a crash without looping a
+#   clean exit. Use `systemctl --user stop openhands` for an intentional
+#   shutdown.
+# - Wants/After network-online.target wait for the network; the user manager
+#   honors dependencies on system targets.
+# - For the service to start at BOOT (not just at login), lingering must be
+#   enabled for the owning user: `loginctl enable-linger $USER`. The installer
+#   attempts this automatically.
+
+[Unit]
+Description=OpenHands full-stack local dev launcher (agent-canvas + agent-server)
+Documentation=file://%OPENHANDS_REPO_ROOT%/docs/prd/4_systemd-service-install.md
+Wants=network-online.target
+After=network-online.target
+# Bound retry rate across boots/reloads. On modern systemd the StartLimit*
+# directives live here in [Unit], not in [Service].
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=%OPENHANDS_REPO_ROOT%
+ExecStart=%OPENHANDS_REPO_ROOT%/scripts/dev-local.sh
+# Keep the stack's own crash-coupling intact: only restart on failure, never
+# on a clean exit, and back off so a broken environment doesn't thrash.
+# The StartLimit* directives are in [Unit] (their modern location).
+Restart=on-failure
+RestartSec=10s
+# Let the launcher manage its child services' process groups (it uses set -m).
+# Kill the launcher with SIGTERM but allow it to clean up its children.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30s
+# Where the launcher writes its logs. View with:
+#   journalctl --user -u openhands -f
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
