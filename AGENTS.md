@@ -174,12 +174,11 @@ The full stack runs strictly from this repository's sources, supervised by **PM2
 - **Frontend** — the Agent Canvas Vite dev server from `packages/agent-canvas` (`dev:frontend`), proxying `/api` to the local backend via `VITE_BACKEND_HOST`.
 - **Ingress** — the whole stack behind one origin, routing API/websocket paths to the backend and everything else to the frontend, so the browser makes same-origin calls. Runs via `scripts/dev-local-ingress.mjs` (see `docs/prd/4_ingress-host-wrapper.md`), a thin wrapper that reuses the upstream proxy internals unmodified and adds only a bind address. Everything binds loopback by default; expose a service by setting `DEV_<service>_BIND`.
 
-PM2 supervises each service with bounded auto-restart (`max_restarts`, `min_uptime`, `restart_delay`) and a `max_memory_restart` threshold. Apps are grouped by namespace, so group verbs (`pm2 restart prod`, `pm2 stop dev2`) and single-app verbs (`pm2 logs backend-dev1`) both work. The id is read fresh on every PM2 evaluation and baked into `pm2 save` snapshots, so `pm2 resurrect` restores prod and all dev instances with the correct ports. Named runtime environments are selected with `--env <name>` (`env` / `staging` / `production`). The stack runs unprivileged; it binds no port below 1024 and writes only to workspace-owned, gitignored trees.
+PM2 supervises each service with bounded auto-restart (`max_restarts`, `min_uptime`, `restart_delay`) and a `max_memory_restart` threshold. Apps are grouped by namespace, so group verbs (`pm2 restart prod`, `pm2 stop dev2`) and single-app verbs (`pm2 logs backend-dev1`) both work. The id is read fresh on every PM2 evaluation and baked into `pm2 save` snapshots, so `pm2 resurrect` restores prod and all dev instances with the correct ports. `NODE_ENV` is derived from role (prod → `production`, dev → `development`); there are no named env blocks. The stack runs unprivileged; it binds no port below 1024 and writes only to workspace-owned, gitignored trees.
 
 ```sh
 just setup                             # uv sync + npm install (once per checkout)
-just dev                               # pm2 start ecosystem.config.js (defaults to --env env)
-just dev --env staging                 # select a named runtime environment
+just dev                               # pm2 start ecosystem.config.js
 just dev-status                        # pm2 ls (grouped by namespace)
 just dev-logs backend-dev1             # tail one app (or a namespace, or everything)
 just dev-restart dev1                  # restart a whole instance by namespace

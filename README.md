@@ -60,8 +60,7 @@ The stack runs strictly from this repository's sources (no upstream releases are
 
 ```bash
 just setup            # uv sync + npm install (once per checkout)
-just dev              # pm2 start ecosystem.config.js (defaults to --env env)
-just dev --env staging
+just dev              # pm2 start ecosystem.config.js
 ```
 
 Everything binds loopback by default. To reach a service from another machine, set its bind env before starting, e.g. `DEV_INGRESS_BIND=0.0.0.0 just dev`. PM2 supervises each service with bounded auto-restart and a memory threshold. Manage it with the verbs:
@@ -93,7 +92,7 @@ just setup-remotes  # set up the upstream git remotes
 just sync           # pull both upstream subtrees
 ```
 
-`just dev` points the launcher at local sources and supervises it with PM2 via the committed `ecosystem.config.js`. Named runtime environments are selected with `just dev --env <env|staging|production>`; a unique PM2 deployment name (and isolated PM2 state) keeps concurrent checkouts from colliding.
+`just dev` points the launcher at local sources and supervises it with PM2 via the committed `ecosystem.config.js`. Role (prod under `/opt`, dev elsewhere) derives `NODE_ENV` and the port block, and a unique PM2 namespace per checkout keeps concurrent checkouts from colliding.
 
 ## Develop
 

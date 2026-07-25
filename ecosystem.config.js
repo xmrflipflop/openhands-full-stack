@@ -8,8 +8,9 @@
  * deployment-specific value (role, app-name tag, ports, PM2 namespace, runtime
  * environment) is computed from where the repo is checked out and a tiny
  * per-checkout .dev-id file. There is no launcher script and no per-invocation
- * flag surface — `pm2 start ecosystem.config.js` (optionally `--env <name>`)
- * is the whole command, and `just dev` forwards to exactly that.
+ * flag surface — `pm2 start ecosystem.config.js` is the whole command, and
+ * `just dev` forwards to exactly that. NODE_ENV is derived from role
+ * (prod → production, dev → development); there are no named env blocks.
  *
  * Three cooperating services, all launched strictly from THIS repository:
  *
@@ -136,14 +137,14 @@ const sharedEnv = {
   VITE_SESSION_API_KEY: apiKey,
 };
 
-// Per-app named runtime environments (env / env_staging / env_production),
-// selectable with `pm2 start ... --env <name>`. Prod defaults to env_production;
-// dev defaults to env (FR10). Env-specific values live ONLY here.
-const envBlocks = {
-  env: { NODE_ENV: "development", DEV_ENV_NAME: "env" },
-  env_staging: { NODE_ENV: "production", DEV_ENV_NAME: "staging" },
-  env_production: { NODE_ENV: "production", DEV_ENV_NAME: "production" },
-};
+// NODE_ENV is derived from role: prod → "production", dev → "development".
+// It is the ONLY env-mode variable any application code reads (the frontend
+// uses it for i18n debug logging and an isDevMode flag; the backend ignores it).
+// No DEV_ENV_NAME / env_staging / env_production blocks: the earlier named-
+// environment machinery was removed because those values were set but never
+// consumed (see docs/prd/1_local-dev-launcher.md FR10).
+const NODE_ENV = isProd ? "production" : "development";
+
 
 // Per-app supervision limits (FR11): bounded auto-restart + memory guard.
 const supervise = {
@@ -175,9 +176,7 @@ const apps = [
     script: AGENT_SERVER_SCRIPT,
     interpreter: UV_VENV_PYTHON,
     args: `--host ${backendBind} --port ${BACKEND_PORT}`,
-    env: { ...sharedEnv, ...envBlocks.env, PYTHONUNBUFFERED: "1" },
-    env_staging: { ...sharedEnv, ...envBlocks.env_staging, PYTHONUNBUFFERED: "1" },
-    env_production: { ...sharedEnv, ...envBlocks.env_production, PYTHONUNBUFFERED: "1" },
+    env: { ...sharedEnv, NODE_ENV, PYTHONUNBUFFERED: "1" },
     ...supervise,
     ...logFields("backend"),
   },
@@ -190,19 +189,7 @@ const apps = [
     interpreter: "none",
     env: {
       ...sharedEnv,
-      ...envBlocks.env,
-      VITE_FRONTEND_PORT: String(FRONTEND_PORT),
-      VITE_BACKEND_HOST: backendHost,
-    },
-    env_staging: {
-      ...sharedEnv,
-      ...envBlocks.env_staging,
-      VITE_FRONTEND_PORT: String(FRONTEND_PORT),
-      VITE_BACKEND_HOST: backendHost,
-    },
-    env_production: {
-      ...sharedEnv,
-      ...envBlocks.env_production,
+      NODE_ENV,
       VITE_FRONTEND_PORT: String(FRONTEND_PORT),
       VITE_BACKEND_HOST: backendHost,
     },
@@ -221,9 +208,7 @@ const apps = [
       ...backendRoutes.map((r) => `--route ${r}=http://${backendHost}`),
       `--default http://${frontendBind}:${FRONTEND_PORT}`,
     ].join(" "),
-    env: { ...sharedEnv, ...envBlocks.env },
-    env_staging: { ...sharedEnv, ...envBlocks.env_staging },
-    env_production: { ...sharedEnv, ...envBlocks.env_production },
+    env: { ...sharedEnv, NODE_ENV },
     ...supervise,
     ...logFields("ingress"),
   },

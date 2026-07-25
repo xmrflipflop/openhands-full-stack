@@ -9,10 +9,9 @@ help:
 
 # Start the PM2-managed local dev stack (frontend + backend + ingress).
 # The ecosystem is self-deriving: role from the checkout path (/opt = prod,
-# else dev) and identity/ports from .dev-id. Pass `--env staging|production`
-# to select a named runtime environment. Run `uv sync` in the SDK package and
-# `npm install` in the frontend package first if the venv/node_modules are
-# missing — see setup.
+# else dev) and identity/ports from .dev-id; NODE_ENV is derived from role.
+# Run `uv sync` in the SDK package and `npm install` in the frontend package
+# first if the venv/node_modules are missing — see setup.
 dev *args:
     pm2 start ecosystem.config.js {{args}}
 
