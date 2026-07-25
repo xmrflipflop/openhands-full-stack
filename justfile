@@ -7,9 +7,18 @@ set shell := ["bash", "-cu"]
 help:
     @just --list
 
-# Start dev server
+# Start the local dev stack in the FOREGROUND: backend + frontend + ingress,
+# streamed logs, Ctrl-C stops everything. The ecosystem is self-deriving (role
+# from the checkout path, identity/ports from .dev-id; NODE_ENV from role).
+# pm2-runtime runs against a THROWAWAY PM2_HOME so the foreground dev run never
+# touches the global ~/.pm2 daemon (where prod lives). Run `just setup` first.
 dev *args:
-    ./scripts/dev-local.sh {{args}}
+    PM2_HOME=/tmp/pm2-fg-openhands-dev pm2-runtime start ecosystem.config.js {{args}}
+
+# Bootstrap dependencies the ecosystem expects (run once per checkout).
+setup:
+    cd packages/software-agent-sdk && uv sync
+    cd packages/agent-canvas && npm install
 
 # build:
 #   echo Building…

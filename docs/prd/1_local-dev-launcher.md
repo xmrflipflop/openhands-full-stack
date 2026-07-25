@@ -4,9 +4,12 @@
 
 ## Summary
 
-A single command that runs the Agent Canvas frontend and the OpenHands Agent Server backend together, built strictly from the source in this repository, so the two subtrees can be developed and validated against each other.
+Run the Agent Canvas frontend and the OpenHands Agent Server backend together, built strictly from the source in this repository, so the two subtrees can be developed and validated against each other. The upstream `agent-canvas` CLI runs a similar stack but installs released artifacts (the agent-server from PyPI via `uvx`, the frontend from the published npm package); this workspace runs the same workflow pointed at local sources instead.
 
-The upstream `agent-canvas` CLI runs a similar stack but installs released artifacts: the agent-server from PyPI (via `uvx`) and the frontend from the published npm package. This workspace needs the same workflow pointed at local sources instead — otherwise local changes to either subtree are never exercised.
+Process management is **PM2**, driven by a single committed `ecosystem.config.js` that derives everything from where it is running. There is no custom launcher script: the ecosystem reads the checkout's role and identity from the filesystem and computes app names, ports, namespace, and `NODE_ENV` from them. The two operating modes are intentionally distinct:
+
+- **Dev (foreground).** `just dev` runs `pm2-runtime` in the foreground against a throwaway `PM2_HOME`, so the dev run never touches the global `~/.pm2` daemon. Logs stream to the terminal; Ctrl-C stops the whole stack; there is no state to manage, save, or resurrect. This is the day-to-day developer loop.
+- **Prod (detached).** A checkout under `/opt` is started with plain `pm2 start ecosystem.config.js` against the global daemon, then managed with PM2's own verbs (`pm2 ls`, `pm2 logs`), snapshotted with `pm2 save`, and restored across machine restarts with `pm2 resurrect`. The id-from-path/id-from-file derivation is read fresh on every evaluation, so resurrected instances come back with the correct ports.
 
 ## Scope
 
@@ -14,62 +17,76 @@ Workspace-owned only; no upstream files are modified.
 
 | Path | Role |
 | --- | --- |
-| `scripts/dev-local.sh` | The launcher (workspace-owned) |
-| `scripts/dev-local-ingress.mjs` | Ingress runner (workspace-owned); adds a bind address on top of the upstream proxy internals |
-| `packages/agent-canvas` | Consumed: frontend dev server, its configuration surface, and its reverse-proxy internals |
-| `packages/software-agent-sdk` | Consumed: agent-server entry point and its Python workspace |
+| `ecosystem.config.js` | The single committed PM2 process ecosystem (workspace-owned). Derives role, identity, app names, ports, namespace, and `NODE_ENV` from the checkout location and a per-checkout id; defines the uv-venv interpreter and supervision limits. No secrets or env-specific values are hard-coded in app code. |
+| `scripts/dev-local-ingress.mjs` | The single-origin ingress app (workspace-owned), the third PM2 app. A thin wrapper over the upstream ingress that adds only a bind address; its existence is justified in `docs/prd/4_ingress-host-wrapper.md`. |
+| `.gitignore` | Ignores the per-checkout identity file, the uv venv, node_modules, and PM2 runtime state. |
+| `packages/agent-canvas` | Consumed: the frontend dev server and its dev-proxy / configuration surface; the ingress script and proxy internals consumed by the wrapper. |
+| `packages/software-agent-sdk` | Consumed: the agent-server entry point and its uv workspace; the `uv sync`-managed `.venv` is the PM2 backend interpreter. |
+
+### Retired by this revision
+
+This revision replaces an earlier, over-engineered build with direct PM2. The following workspace-owned files (no longer in the tree) are **removed** by the migration to this PRD:
+
+| Role it played | Notes |
+| --- | --- |
+| The pre-PM2 foreground shell supervisor | Process-group-based crash-linked supervision. Replaced by PM2. |
+| The bespoke PM2 launcher | A flag surface, hash-derived names, per-deployment `PM2_HOME` isolation, a "last started" name file, and orphan-reaping logic. Replaced by the self-deriving ecosystem. |
+| The backend entry shim | A PM2 file-path entry point for the agent-server. Retired in favor of pointing PM2's `script` at the venv `agent-server` console script directly. |
 
 ## Functional requirements
 
-- **FR1** — Default invocation starts both frontend and backend. `--frontend-only` and `--backend-only` each start exactly one of them and are mutually exclusive.
-- **FR2** — The backend runs from the local `packages/software-agent-sdk` sources. No `openhands-*` package may be fetched as a registry release.
-- **FR3** — The frontend is the local `packages/agent-canvas` dev server. The published `@openhands/agent-canvas` package must never be installed or executed.
-- **FR4** — The proxies (single-origin entry and frontend dev proxy) derive their backend target from the launched backend's actual address; no separate target flag exists. In frontend-only mode they expect a backend on this machine at the configured backend port.
-- **FR5** — If any launched service exits, for any reason, all other launched services are stopped and the launcher exits, propagating the failed service's status.
-- **FR6** — Interrupting or terminating the launcher stops all services without leaving orphan processes.
-- **FR7** — Frontend and backend share a session API key. If the user does not supply one, a generated key persists across restarts.
-- **FR8** — UI and backend ports are configurable via flags; defaults follow upstream conventions (UI 8000, agent-server 18000).
-- **FR9** — The whole stack is additionally served behind a single origin (one host:port) that routes API and websocket paths to the backend and everything else to the frontend, so browsers on machines other than the server work without reaching the backend port. This single-origin entry runs by default in every mode and is disableable by flag.
-- **FR10** — The direct frontend and backend ports remain available alongside the single-origin entry, for debugging.
-- **FR11** — Pages served from any of the exposed ports must lead the browser to make same-origin API and websocket calls (no absolute loopback or server-local backend addresses baked into what the browser executes).
-- **FR12** — Everything binds loopback by default, including the single-origin entry. One bind-address option (`--host`) controls the single-origin entry only; a separate opt-in flag (`--expose-debug`) binds the debug ports to that same address. Nothing is reachable from other machines without an explicit choice.
+- **FR1** — A single committed `ecosystem.config.js` at the repo root defines every app. It derives role, identity, app names, ports, namespace, and `NODE_ENV` from the checkout location and a per-checkout id at evaluation time, so starting (in either foreground-dev or detached-prod mode) requires no per-invocation flags to produce a correct, clash-free deployment.
+- **FR2** — Role comes from the checkout path. A checkout located under `/opt` is **prod** (exactly one, fixed base ports). Any other checkout location is **dev**. The role selects `NODE_ENV` and the port block.
+- **FR3** — Each non-prod checkout carries a `.dev-id` file containing a positive integer, unique per checkout (e.g. `1`, `2`, … across worktrees). The ecosystem reads it fresh on every evaluation; a missing or invalid `.dev-id` for a non-prod checkout is a hard error that aborts the start, so a clash can never happen silently. `.dev-id` is gitignored and never committed.
+- **FR4** — The id (treated as `0` for prod) is the single source of truth: the app-name tag, the PM2 namespace, and the frontend/backend port block all derive from it. Because names are derived from the id, name uniqueness implies port uniqueness; there is no independent port to misconfigure.
+- **FR5** — PM2 app names are `<service>-<tag>` where `tag` is `prod` or `dev<N>` (e.g. `backend-prod`, `backend-dev1`, `frontend-dev2`). The PM2 `namespace` is the tag, so group operations (`pm2 restart prod`, `pm2 stop dev2`) and single-app operations (`pm2 logs backend-dev1`) both work naturally.
+- **FR6** — Concurrent deployments never clash on ports or app names: the id-derived port block and tag keep dev checkouts (distinct `.dev-id`) and the single prod checkout disjoint. Because dev runs in the foreground against a throwaway `PM2_HOME`, the supported concurrent case is one foreground dev stack per terminal plus any detached prod; two simultaneous foreground dev stacks sharing the same throwaway home would collide on the daemon socket, so a second concurrent dev checkout must use a distinct `PM2_HOME`.
+- **FR7** — The backend runs from local `packages/software-agent-sdk` sources and is launched with the repository's uv-managed virtual environment specified explicitly as PM2's `interpreter` (not system Python, not `uvx`, not a PyPI release). `uv sync` materialises that venv with workspace members in editable mode before start, so every `openhands-*` package resolves to local sources. No `openhands-*` release may be fetched from a registry. PM2's `script` points at the venv's installed `agent-server` console script (under `packages/software-agent-sdk/.venv/bin`); the venv python is the `interpreter`, so the composed command is `<venv>/bin/python <venv>/bin/agent-server --host .. --port ..` and the installed package imports cleanly.
+- **FR8** — The frontend is the local `packages/agent-canvas` dev server. The published `@openhands/agent-canvas` package must never be installed or executed. The frontend's built-in dev proxy targets the backend at the backend's derived port (supplied via the frontend's documented backend-URL configuration).
+- **FR9** — The whole stack is additionally served behind a single origin (one host:port, the ingress app) that routes API and websocket paths to the backend and everything else to the frontend, so the browser makes same-origin API/websocket calls. The ingress is the third PM2 app, run by `scripts/dev-local-ingress.mjs` (justified in `docs/prd/4_ingress-host-wrapper.md`). Its bind address is controllable (loopback by default; exposed on demand).
+- **FR10** — `NODE_ENV` is derived from role: prod → `production`, dev → `development`. It is the only env-mode variable any application code reads (the frontend uses it for i18n debug logging and an `isDevMode` flag; the backend ignores it). There are no named runtime-environment blocks (`env_staging` / `env_production`) and no `--env <name>` selection — the earlier named-environment machinery was removed because `DEV_ENV_NAME` was set but never consumed and the blocks differed only in `NODE_ENV`, which role already determines.
+- **FR11** — PM2 supervises frontend, backend, and ingress with bounded auto-restart: `autorestart`, a `max_restarts` limit, `min_uptime`, `restart_delay`, and a `max_memory_restart` threshold. A process that repeatedly fails within its minimum-uptime window is held in `errored` state rather than spinning.
+- **FR12** — The stack runs unprivileged: no port below 1024 is bound, and all writes stay inside the checkout. Root is not required for normal operation. Privilege drop via PM2 `uid`/`gid` is documented but disabled by default and only honoured when PM2 is started as root.
+- **FR13** — Two operating modes use the same `ecosystem.config.js` differently: (a) **dev** is foreground via `pm2-runtime` with a throwaway `PM2_HOME` (set by `just dev`), so the dev run never touches the global `~/.pm2` daemon; Ctrl-C stops the whole stack and there is no state to manage. (b) **prod** is detached via plain `pm2 start ecosystem.config.js` against the global daemon, then managed with PM2's own verbs (`pm2 ls`, `pm2 logs <app>`), snapshotted with `pm2 save`, and restored across machine restarts with `pm2 resurrect`.
+- **FR14** — `just dev` is a thin wrapper that runs `pm2-runtime start ecosystem.config.js` against a throwaway `PM2_HOME`. It is not a supervisor, adds no process-management logic of its own, and exposes no dev-specific stop/restart/status/logs/save verbs — foreground `pm2-runtime` and PM2's own verbs cover all of it. The throwaway home keeps dev state out of the global daemon where prod lives.
 
 ## Non-functional requirements
 
-- **NFR1** — Runs on the stock macOS shell (bash 3.2) and current Linux bash.
-- **NFR2** — Zero network surface by default: every service, including the single-origin entry, binds loopback. Any external exposure must be an explicit user choice.
-- **NFR3** — Makes no modifications inside `packages/`; consumes only documented upstream configuration surfaces (environment variables, CLI flags, package scripts).
-- **NFR4** — The CLI surface stays recognizable to upstream `agent-canvas` CLI users (same split-flag names and defaults where they apply).
+- **NFR1** — Portable, POSIX-only scripting where any scripting is needed (the Coder host and contributor laptops may run macOS bash 3.2).
+- **NFR2** — The id-from-path and id-from-file derivation is read fresh on every PM2 evaluation, so a detached-prod `pm2 resurrect` brings the prod instance back with the correct ports after a machine restart. Dev runs are foreground and throwaway: nothing is saved or resurrected for dev, so there is no dev state to drift.
+- **NFR3** — No credentials, tokens, or `.dev-id` values are committed. The `.gitignore` covers `.dev-id`, venvs, node_modules, and PM2 runtime state.
+- **NFR4** — Concurrent checkouts never collide: the id is the single source of truth for names and ports, and a missing/invalid `.dev-id` fails fast.
 
 ## Decision points
 
-- **Reuse upstream's dev pipeline vs. own launcher.** Rejected reuse: the upstream pipeline downloads the agent-server and the automation backend from external sources by default, violating FR2 and pulling in unvendored components.
-- **Run the backend through the SDK's own Python workspace vs. building it from a local path with upstream's installer tooling.** The SDK's workspace mechanism was chosen: it is the SDK's native development path and guarantees every `openhands-*` package resolves to local sources.
-- **Dedicated ingress proxy vs. the frontend dev server's own proxying.** Originally the frontend's built-in dev proxy alone was chosen. Revised when remote-client browsing became a requirement (FR9): the stack now also runs the frontend package's own standalone ingress script, consumed unmodified as an upstream extension point, to provide the single-origin entry — rather than writing a workspace-owned proxy that would duplicate upstream functionality.
-- **Browser-to-backend addressing.** The frontend's baked backend address is left unset so the app falls back to same-origin requests (FR11), which both the ingress and the dev server's proxy forward to the backend. Baking a concrete backend address was rejected: it only works for browsers on the server itself.
-- **Debug-port binding.** The frontend package's dev configuration binds all interfaces by default. Rather than patching that configuration (a subtree edit), the launcher overrides the bind address through the dev command's own host option, keeping debug ports loopback-only (FR12) without touching upstream files.
-- **Ingress bind address.** The upstream standalone ingress always listens on all interfaces and offers no bind-address option. Patching it (subtree edit) was rejected; instead a thin workspace-owned runner reuses the upstream proxy internals unmodified and adds only the bind step. If upstream adds a bind-address option, the runner should be retired in its favor.
-- **Backend target flag removed.** An earlier revision had a flag naming the backend the proxies target. Removed: the target is now derived from the launched backend's actual address, eliminating a flag that could contradict reality. The cost is that frontend-only setups pointing at a backend on another machine are no longer expressible; that trade was accepted deliberately.
-- **Automation backend.** Deliberately excluded: the OpenHands Automation project is not vendored in this repository, and starting it would require fetching an external release. Automation-dependent UI features are accepted as unavailable locally.
+- **Self-deriving ecosystem vs. a custom launcher script.** Chose the self-deriving ecosystem. The earlier bespoke launcher accumulated a flag surface, hash-derived names, per-deployment `PM2_HOME` isolation, a "last started" name file, and orphan-reaping logic — far more machinery than the problem needs. Deriving role and identity inside `ecosystem.config.js` from path and `.dev-id` keeps one source of truth and lets PM2's own verbs do all the work.
+- **Role from path vs. an explicit `--role` flag.** Path is automatic and unambiguous for the `/opt` = prod convention; it cannot be forgotten on a start.
+- **`.dev-id` file vs. a derived/hash id.** A small explicit file is the clearest single source of truth, is unique per checkout, and survives `pm2 save` / `pm2 resurrect` (the id is read fresh each evaluation and baked into the snapshot). A hash of the path would also be unique but is opaque and harder to reason about for `pm2 logs backend-dev1`.
+- **Single shared PM2 registry + namespaces vs. per-deployment `PM2_HOME` isolation.** Chose shared + namespaces. The prior per-deployment `PM2_HOME` was over-isolation: it defeated PM2's group operations, required a custom wrapper to find the right registry, and made orphan reaping necessary. A single registry with `namespace` per instance gives `pm2 restart prod` / `pm2 stop dev2` for free and one `pm2 resurrect` to restore everything.
+- **Single-origin ingress vs. frontend dev proxy alone.** Kept the single-origin ingress as the third PM2 app (Option B), so the whole stack is served behind one host:port and the browser makes same-origin API/websocket calls. Because the upstream ingress cannot bind a host, it runs through the thin workspace-owned wrapper `scripts/dev-local-ingress.mjs` (justified in `docs/prd/4_ingress-host-wrapper.md`); the frontend's built-in dev proxy is not relied upon for the single-origin contract.
+- **Backend launch: venv console script vs. `uv run` / a workspace shim.** PM2 resolves its `script` field as a file path and cannot run `python -m openhands.agent_server` directly; pointing at the package `__main__.py` shadows the installed package on `sys.path[0]`. The SDK's installed `agent-server` console script (under the venv's `bin`) is a file path whose own body is a clean `from openhands.agent_server.__main__ import main; sys.exit(main())`, so pointing PM2's `script` at it with the venv python as `interpreter` runs the server with no shadowing and no workspace-owned shim. A workspace shim was considered and rejected as redundant: it would duplicate the console script's body. Using `uv run` was rejected because it adds a wrapper process and keeps PM2's process tree non-flat.
+- **Prod under `/opt` vs. an environment variable.** The path convention is chosen because the prod checkout's location is itself the deployment signal in the Coder setup. Note the Coder caveat: `/opt` is typically not on the persistent home volume, so the prod clone (and its `chown` to the unprivileged user) belongs in the image or startup script, and `pm2 save` must be re-run whenever the set of instances changes.
+- **Foreground `pm2-runtime` (dev) vs. detached `pm2 start` (prod).** Dev runs in the foreground against a throwaway `PM2_HOME` so it never touches the global `~/.pm2` daemon where prod lives: logs stream inline, Ctrl-C stops everything, and there is no state to manage, save, or resurrect — which removes the need for dev-specific stop/restart/status/logs/save wrapper recipes entirely. Prod keeps the detached `pm2 start` + `pm2 save` + `pm2 resurrect` lifecycle because it must survive the operator disconnecting. Rejected for dev: a detached daemon with wrapper verbs — more machinery than the foreground loop needs.
+- **Derived `NODE_ENV` vs. named runtime environments (`--env`).** The ecosystem originally provided `env` / `env_staging` / `env_production` blocks selectable with `--env <name>`. Removed in favor of deriving `NODE_ENV` from role (prod → `production`, dev → `development`). `DEV_ENV_NAME` was set but consumed by nothing; the blocks differed only in `NODE_ENV`, which role already determines; and the only readers of `NODE_ENV` are the frontend's i18n debug logging and an `isDevMode` flag (the backend ignores it). Named environments added a selection surface with no behavioral payoff.
 
 ## Assumptions (re-check these first when upstream changes)
 
-- The SDK remains a single Python workspace whose members include the agent-server, and exposes a runnable agent-server entry point accepting host and port options.
-- The frontend keeps a package script that starts only the dev server (without spawning backends), and honors environment configuration for its port, backend host, backend base URL, and session API key.
-- The frontend's dev command accepts a host option that takes precedence over the bind address in its configuration file.
-- The frontend dev server proxies API paths to the configured backend host.
-- When no backend address is baked into the frontend, the app falls back to same-origin (browser location) for API and websocket calls.
-- The frontend package ships backend-agnostic reverse-proxy internals (path-prefix router and HTTP/websocket proxy handlers) importable from its scripts directory, alongside a standalone ingress script that uses them.
-- The set of URL path prefixes the backend serves (API, websockets, docs, health) matches the prefixes the frontend's own dev proxy forwards.
-- Backend and frontend authenticate with a shared session API key supplied through environment configuration.
-- Default ports and the session-key convention continue to follow the frontend package's central defaults configuration.
+- `pm2` (any current v7+) is installed on contributor machines, in CI, and in the Coder image.
+- The Coder host convention holds: the prod checkout lives under `/opt`; dev checkouts (including git worktrees) live elsewhere, typically under the home tree.
+- The SDK remains a single uv workspace whose members include the agent-server; it exposes a runnable agent-server entry point accepting host and port options; and `uv sync` materialises a `.venv` whose `python` can import and run the agent-server entry function.
+- The frontend keeps a `dev:frontend` package script that starts only the dev server (without spawning backends), honours environment configuration for its port and backend base URL, and proxies API/websocket paths to the configured backend.
+- The frontend's backend-URL configuration accepts a `http://host:port` value that the dev proxy forwards to.
 
 ## Upstream divergence
 
-No upstream code is modified; the divergence is behavioral. Upstream's launcher installs released artifacts by design; this launcher forbids that and runs local sources. It is therefore not upstreamable as-is. If upstream ever ships a supported "run everything from a local checkout" mode covering both projects, this launcher can be retired in its favor.
+No upstream code is modified; the divergence is behavioral. Upstream's launcher installs released artifacts by design; this one forbids that and runs local sources, so it is not upstreamable as-is. If upstream ever ships a supported "run everything from a local checkout" mode covering both projects, this functionality can be retired in its favor.
 
-The workspace ingress runner duplicates the small server-assembly portion of the upstream ingress script (not its routing or proxying logic, which are imported unmodified) solely to control the bind address. A bind-address option would be a reasonable upstream contribution; upstreaming it retires the runner.
+The PM2 ecosystem is workspace-owned; it is not an upstream contribution because upstream does not supervise its launcher with PM2. The backend launch uses the SDK's own installed `agent-server` console script (no workspace-owned backend entry file).
 
 ## Conflict resolution notes
 
-If an upstream update breaks the launcher, preserve the requirements, not the implementation. Re-locate the SDK's current way of running the agent-server from workspace sources and the frontend's current dev-server script and configuration surface, then rewire the launcher to them. Any of FR1–FR8 may be reimplemented with different mechanics; none may be dropped silently.
+Preserve the requirements, not the implementation. If an upstream update breaks the stack, re-locate the SDK's current way of running the agent-server from workspace sources (`uv sync` + the venv python) and the frontend's current dev-server script and configuration surface, then rewire the ecosystem to them. Any functional requirement may be reimplemented with different mechanics; none may be dropped silently. The stable invariants are the id-from-path/id-from-file contract (FR2–FR4), the local-sources-only contract (FR7–FR8), the uv-venv-as-interpreter contract (FR7), and the PM2-supervision contract (FR11, FR13). A future rework must not silently reintroduce a bespoke launcher that duplicates PM2's own verbs, nor drop the fail-fast `.dev-id` check that prevents silent port clashes, without revising this PRD first.
+
+## Migration status
+
+Implemented. The ecosystem is the self-deriving form (path → role, `.dev-id` → id/ports/namespace, three apps including the ingress); the bespoke launcher, the pre-PM2 shell supervisor, and the backend entry shim have been removed. `just dev` runs the stack in the foreground via `pm2-runtime` against a throwaway `PM2_HOME` (no dev-specific stop/restart/status/logs/save recipes); prod uses the detached `pm2 start` + `pm2 save` + `pm2 resurrect` lifecycle. The ingress wrapper `scripts/dev-local-ingress.mjs` is retained (see `docs/prd/4_ingress-host-wrapper.md`).

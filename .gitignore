@@ -1,0 +1,21 @@
+# Workspace-owned ignores. Keeps generated / machine-local artifacts that the
+# PM2-managed dev stack produces out of version control. Nested packages keep
+# their own .gitignore (e.g. agent-canvas ignores node_modules upstream); the
+# entries below cover workspace-level and cross-package generated state.
+
+# Per-checkout dev identity (unique positive integer; see docs/prd/1_local-dev-launcher.md FR3).
+/.dev-id
+
+# PM2 runtime state (per-deployment process registry, logs, pids).
+/.pm2-runtime/
+
+# Persisted dev session API key and other local secrets.
+/.dev-local/
+
+# uv-managed Python virtual environments created under the SDK package.
+/packages/software-agent-sdk/.venv/
+
+# Frontend dependencies installed by the launcher (packages carries its own
+# upstream .gitignore; this is a belt-and-braces workspace guard).
+/node_modules/
+/**/node_modules/

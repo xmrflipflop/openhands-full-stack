@@ -1,17 +1,19 @@
 #!/usr/bin/env node
 /**
- * dev-local-ingress.mjs — workspace-owned ingress runner for dev-local.sh.
+ * dev-local-ingress.mjs — workspace-owned ingress runner for the PM2 stack.
  *
  * The upstream standalone ingress (packages/agent-canvas/scripts/ingress.mjs)
  * has no bind-address option: it listens on all interfaces. This wrapper
  * reuses the upstream routing and proxy internals (proxy-utils.mjs, consumed
- * unmodified) and adds only a --host option so the launcher can keep the
- * stack port loopback-only by default.
+ * unmodified) and adds only a --host option so the stack port can stay
+ * loopback-only by default. It is launched as one PM2 app by
+ * ecosystem.config.js (driven by `just dev`).
  *
  * If upstream's ingress ever grows a bind-address option, retire this file
  * and call it directly.
  *
- * PRD: docs/prd/1_local-dev-launcher.md
+ * PRD: docs/prd/1_local-dev-launcher.md (the third PM2 app)
+ * PRD: docs/prd/4_ingress-host-wrapper.md (this file's existence)
  *
  * Usage:
  *   node scripts/dev-local-ingress.mjs \

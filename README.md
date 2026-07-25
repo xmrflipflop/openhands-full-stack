@@ -45,41 +45,67 @@ A normal clone is sufficient. Do not run `git submodule init` or `git submodule 
 
 ## Run the stack locally
 
-**Prerequisites**: [`just`](https://github.com/casey/just), Node.js 22.12+, `npm`, [`uv`](https://docs.astral.sh/uv/)
+**Prerequisites**: [`just`](https://github.com/casey/just), [`pm2`](https://pm2.keymetrics.io/) (v7+), Node.js 22.12+, `npm`, [`uv`](https://docs.astral.sh/uv/)
+
+The stack runs strictly from this repository's sources (no upstream releases are downloaded), supervised by PM2 through one committed `ecosystem.config.js`. The ecosystem is **self-deriving**: it reads the checkout's role and identity from the filesystem and computes app names, ports, and namespace from them — there is no launcher script.
+
+- A checkout under `/opt` is **prod** (base ports); anywhere else is **dev**.
+- Each dev checkout needs a `.dev-id` file (gitignored) holding a unique positive integer, e.g. `echo 1 > .dev-id`. That id derives the port block, app-name tag (`dev1`, `dev2`, …), and PM2 namespace, so concurrent checkouts never clash. (Prod uses id `0` and needs no `.dev-id`.)
+
+| Service | Prod | dev1 | dev2 | Purpose |
+| --- | --- | --- | --- | --- |
+| Stack (ingress) | `:9000` | `:9010` | `:9020` | Single-origin entry point — browse here |
+| Frontend (Vite) | `:3000` | `:3010` | `:3020` | Direct dev-server port, for debugging |
+| Backend (agent-server) | `:18000` | `:18010` | `:18020` | Direct API port, for debugging (`/docs`) |
+
+### Dev (foreground)
 
 ```bash
-just dev
+just setup            # uv sync + npm install (once per checkout)
+just dev              # foreground: backend + frontend + ingress, logs stream, Ctrl-C stops all
 ```
 
-This starts, strictly from the source in this repository (no upstream releases are downloaded):
+`just dev` runs `pm2-runtime` in the foreground against a throwaway `PM2_HOME` (`/tmp/pm2-fg-openhands-dev`), so the dev run never touches the global `~/.pm2` daemon. Logs stream to the terminal; Ctrl-C stops the whole stack; there is no state to manage, save, or resurrect. Everything binds loopback by default — to reach a service from another machine, set its bind env before starting, e.g. `DEV_INGRESS_BIND=0.0.0.0 just dev`.
 
-| Service | Port | Purpose |
-| --- | --- | --- |
-| Stack (ingress) | `:9000` | Single-origin entry point — browse here |
-| Frontend (Vite) | `:8000` | Direct dev-server port, for debugging |
-| Backend (agent-server) | `:18000` | Direct API port, for debugging (`/docs`) |
+The OpenHands Automation backend is not part of this repository and is not started.
 
-Everything binds loopback by default. To reach the stack from another machine, expose the ingress port:
+### Production (detached)
+
+For a production deployment, clone the repository under `/opt` (the path is the prod signal) and run against the **global** PM2 daemon so the stack survives the operator disconnecting and restarts across machine reboots:
 
 ```bash
-just dev --host 0.0.0.0                 # expose the stack port only
-just dev --host 0.0.0.0 --expose-debug  # debug ports too
+git clone <repo-url> /opt/openhands
+cd /opt/openhands
+just setup                       # uv sync + npm install
+pm2 start ecosystem.config.js    # detached, on the global daemon (~/.pm2)
 ```
 
-If any service exits, the whole stack shuts down. All launcher flags pass through `just dev`; see `scripts/dev-local.sh --help` for the full list. The OpenHands Automation backend is not part of this repository and is not started.
+Then manage it with PM2's own verbs:
+
+```bash
+pm2 ls                           # process table (grouped by namespace)
+pm2 logs backend-prod            # one app, or `pm2 logs prod` for the whole namespace
+pm2 save                         # snapshot the running set
+pm2 resurrect                    # restore the saved set after a machine restart
+pm2 stop prod && pm2 delete prod # tear down the prod instance
+```
+
+Run `pm2 save` whenever the set of running instances changes, so `pm2 resurrect` restores exactly what you expect.
 
 ## Workspace tasks
 
 Run `just` with no arguments to list all recipes. The common ones:
 
 ```bash
-just dev            # start the local stack
-just lint           # workspace linters, incl. the PRD reference check
-just test           # workspace tests
-just check          # lint + test — run before pushing
-just setup-remotes  # set up the upstream git remotes
-just sync           # pull both upstream subtrees
+just dev             # start the local stack in the foreground (frontend + backend + ingress)
+just lint            # workspace linters, incl. the PRD reference check
+just test            # workspace tests
+just check           # lint + test — run before pushing
+just setup-remotes   # set up the upstream git remotes
+just sync            # pull both upstream subtrees
 ```
+
+`just dev` runs `pm2-runtime` in the foreground against a throwaway `PM2_HOME`, so the dev run never touches the global `~/.pm2` daemon. Role (prod under `/opt`, dev elsewhere) derives `NODE_ENV` and the port block, and a unique PM2 namespace per checkout keeps concurrent checkouts from colliding.
 
 ## Develop
 
