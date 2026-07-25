@@ -44,7 +44,8 @@ This repository is an integration workspace for two canonical OpenHands projects
 | `docker/Dockerfile` | Workspace container image definition |
 | `docker/compose.yaml` | Workspace local-service orchestration |
 | `scripts/` | Repeatable development, CI, and maintenance commands |
-| `scripts/dev-local.sh` | Workspace-owned local full-stack launcher (see Local development launcher) |
+| `scripts/dev-local-ingress.mjs` | Workspace-owned single-origin ingress wrapper (the third PM2 app); adds a bind address to the upstream ingress (see `docs/prd/4_ingress-host-wrapper.md`) |
+| `ecosystem.config.js` | Committed PM2 process ecosystem; self-deriving (role from path, identity/ports from `.dev-id`) |
 | `infra/` | Deployment and infrastructure configuration |
 | `docs/` | Documentation for this combined workspace |
 | `docs/prd/` | One PRD per workspace functionality: requirements, decisions, assumptions, upstream divergence |
@@ -165,24 +166,31 @@ Rules for the justfile:
 
 ## Local development launcher
 
-`scripts/dev-local.sh` starts the full stack strictly from the code in this repository:
+The full stack runs strictly from this repository's sources, supervised by **PM2** through one committed `ecosystem.config.js`. The ecosystem is **self-deriving**: there is no launcher script and no per-invocation flag surface — it computes every deployment-specific value from where the repo is checked out.
 
-- **Backend** — the OpenHands Agent Server, run with `uv run` over the local uv workspace in `packages/software-agent-sdk`. Workspace sources only; it never installs `openhands-*` releases from PyPI.
-- **Frontend** — the Agent Canvas Vite dev server from `packages/agent-canvas` (`npm run dev:frontend`), proxying `/api` to the local backend.
-- **Ingress** — the whole stack behind one origin (default `:9000`) so browsers on other machines never need to reach the backend port. Runs via `scripts/dev-local-ingress.mjs`, a thin workspace-owned runner that reuses the upstream proxy internals (`packages/agent-canvas/scripts/proxy-utils.mjs`, consumed unmodified) and adds only a bind address. The direct frontend (`:8000`) and backend (`:18000`) ports stay up for debugging. Everything binds loopback by default: `--host` exposes the stack port, and `--expose-debug` additionally binds the debug ports to the same address.
+- **Role from path.** A checkout under `/opt` is **prod** (id 0, base ports); anywhere else is **dev**. The prod checkout is the deployment signal in the Coder setup.
+- **Identity from `.dev-id`.** Each dev checkout carries a `.dev-id` file (gitignored) holding a unique positive integer. The id is the single source of truth for the app-name tag (`prod` or `dev<N>`), the PM2 `namespace`, and the port block (frontend/backend/ingress step by 10 per id). A missing or invalid `.dev-id` for a non-prod checkout fails fast — no silent port clash.
+- **Backend** — the OpenHands Agent Server from `packages/software-agent-sdk`. PM2's `script` points at the venv's installed `agent-server` console script (`packages/software-agent-sdk/.venv/bin/agent-server`) with that venv's Python as `interpreter`. `uv sync` materialises the venv with workspace members in editable mode (workspace sources only; never `openhands-*` from PyPI).
+- **Frontend** — the Agent Canvas Vite dev server from `packages/agent-canvas` (`dev:frontend`), proxying `/api` to the local backend via `VITE_BACKEND_HOST`.
+- **Ingress** — the whole stack behind one origin, routing API/websocket paths to the backend and everything else to the frontend, so the browser makes same-origin calls. Runs via `scripts/dev-local-ingress.mjs` (see `docs/prd/4_ingress-host-wrapper.md`), a thin wrapper that reuses the upstream proxy internals unmodified and adds only a bind address. Everything binds loopback by default; expose a service by setting `DEV_<service>_BIND`.
 
-Each service runs in its own process group. If any service exits — crash or clean — the launcher stops everything else and exits with that service's status.
+PM2 supervises each service with bounded auto-restart (`max_restarts`, `min_uptime`, `restart_delay`) and a `max_memory_restart` threshold. Apps are grouped by namespace, so group verbs (`pm2 restart prod`, `pm2 stop dev2`) and single-app verbs (`pm2 logs backend-dev1`) both work. The id is read fresh on every PM2 evaluation and baked into `pm2 save` snapshots, so `pm2 resurrect` restores prod and all dev instances with the correct ports. Named runtime environments are selected with `--env <name>` (`env` / `staging` / `production`). The stack runs unprivileged; it binds no port below 1024 and writes only to workspace-owned, gitignored trees.
 
 ```sh
-just dev                              # frontend + backend + ingress
-just dev --frontend-only              # Vite dev server + ingress
-just dev --backend-only               # local agent-server + ingress
-scripts/dev-local.sh --help           # all options (or: just dev --help)
+just setup                             # uv sync + npm install (once per checkout)
+just dev                               # pm2 start ecosystem.config.js (defaults to --env env)
+just dev --env staging                 # select a named runtime environment
+just dev-status                        # pm2 ls (grouped by namespace)
+just dev-logs backend-dev1             # tail one app (or a namespace, or everything)
+just dev-restart dev1                  # restart a whole instance by namespace
+just dev-stop dev1                     # stop a whole instance by namespace
+just dev-save                          # pm2 save (snapshot for pm2 resurrect)
+pm2 resurrect                          # restore the saved set across a machine restart
 ```
 
-The flag surface mirrors the upstream `agent-canvas` CLI (`--frontend-only`, `--backend-only`), but unlike upstream it never fetches the agent-server via `uvx` from PyPI and never installs the published `@openhands/agent-canvas` package. The OpenHands Automation backend is intentionally not started: that project is not vendored in this repository. Do not "fix" the launcher by pointing it at upstream releases; it exists to exercise the local subtrees.
+Unlike upstream, the stack never fetches the agent-server via `uvx` from PyPI and never installs the published `@openhands/agent-canvas` package. The OpenHands Automation backend is intentionally not started: that project is not vendored in this repository. Do not "fix" the stack by pointing it at upstream releases; it exists to exercise the local subtrees.
 
-The launcher's requirements live in `docs/prd/1_local-dev-launcher.md`, which also serves as the reference example of the PRD format described in Modular and additive changes.
+The launcher's requirements live in `docs/prd/1_local-dev-launcher.md`, which also serves as the reference example of the PRD format described in Modular and additive changes. The ingress wrapper is justified in `docs/prd/4_ingress-host-wrapper.md`.
 
 ## Validation
 

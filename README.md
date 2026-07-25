@@ -45,41 +45,55 @@ A normal clone is sufficient. Do not run `git submodule init` or `git submodule 
 
 ## Run the stack locally
 
-**Prerequisites**: [`just`](https://github.com/casey/just), Node.js 22.12+, `npm`, [`uv`](https://docs.astral.sh/uv/)
+**Prerequisites**: [`just`](https://github.com/casey/just), [`pm2`](https://pm2.keymetrics.io/) (v7+), Node.js 22.12+, `npm`, [`uv`](https://docs.astral.sh/uv/)
+
+The stack runs strictly from this repository's sources (no upstream releases are downloaded), supervised by PM2 through one committed `ecosystem.config.js`. The ecosystem is **self-deriving**: it reads the checkout's role and identity from the filesystem and computes app names, ports, and namespace from them — there is no launcher script.
+
+- A checkout under `/opt` is **prod** (base ports); anywhere else is **dev**.
+- Each dev checkout needs a `.dev-id` file (gitignored) holding a unique positive integer, e.g. `echo 1 > .dev-id`. That id derives the port block, app-name tag (`dev1`, `dev2`, …), and PM2 namespace, so concurrent checkouts never clash. (Prod uses id `0` and needs no `.dev-id`.)
+
+| Service | Prod | dev1 | dev2 | Purpose |
+| --- | --- | --- | --- | --- |
+| Stack (ingress) | `:9000` | `:9010` | `:9020` | Single-origin entry point — browse here |
+| Frontend (Vite) | `:3000` | `:3010` | `:3020` | Direct dev-server port, for debugging |
+| Backend (agent-server) | `:18000` | `:18010` | `:18020` | Direct API port, for debugging (`/docs`) |
 
 ```bash
-just dev
+just setup            # uv sync + npm install (once per checkout)
+just dev              # pm2 start ecosystem.config.js (defaults to --env env)
+just dev --env staging
 ```
 
-This starts, strictly from the source in this repository (no upstream releases are downloaded):
-
-| Service | Port | Purpose |
-| --- | --- | --- |
-| Stack (ingress) | `:9000` | Single-origin entry point — browse here |
-| Frontend (Vite) | `:8000` | Direct dev-server port, for debugging |
-| Backend (agent-server) | `:18000` | Direct API port, for debugging (`/docs`) |
-
-Everything binds loopback by default. To reach the stack from another machine, expose the ingress port:
+Everything binds loopback by default. To reach a service from another machine, set its bind env before starting, e.g. `DEV_INGRESS_BIND=0.0.0.0 just dev`. PM2 supervises each service with bounded auto-restart and a memory threshold. Manage it with the verbs:
 
 ```bash
-just dev --host 0.0.0.0                 # expose the stack port only
-just dev --host 0.0.0.0 --expose-debug  # debug ports too
+just dev-status                  # pm2 ls (grouped by namespace)
+just dev-logs backend-dev1       # tail one app / namespace / everything
+just dev-restart dev1            # restart a whole instance by namespace
+just dev-stop dev1               # stop a whole instance by namespace
+just dev-save                    # snapshot for pm2 resurrect
 ```
 
-If any service exits, the whole stack shuts down. All launcher flags pass through `just dev`; see `scripts/dev-local.sh --help` for the full list. The OpenHands Automation backend is not part of this repository and is not started.
+The OpenHands Automation backend is not part of this repository and is not started.
 
 ## Workspace tasks
 
 Run `just` with no arguments to list all recipes. The common ones:
 
 ```bash
-just dev            # start the local stack
+just dev            # start the local stack (frontend + backend + ingress)
+just dev-status     # `pm2 ls` for this deployment
+just dev-logs       # tail the combined logs
+just dev-stop       # stop the stack and its PM2 daemon
+just dev-restart    # restart the stack's apps in place
 just lint           # workspace linters, incl. the PRD reference check
 just test           # workspace tests
 just check          # lint + test — run before pushing
 just setup-remotes  # set up the upstream git remotes
 just sync           # pull both upstream subtrees
 ```
+
+`just dev` points the launcher at local sources and supervises it with PM2 via the committed `ecosystem.config.js`. Named runtime environments are selected with `just dev --env <env|staging|production>`; a unique PM2 deployment name (and isolated PM2 state) keeps concurrent checkouts from colliding.
 
 ## Develop
 

@@ -22,11 +22,13 @@ Workspace-owned only; no upstream files are modified.
 
 ### Retired by this revision
 
-This revision replaces an earlier, over-engineered build with direct PM2. The following workspace-owned file is to be **removed** when the code is migrated to match this PRD (it still exists in the tree today; the migration is pending — see Migration status):
+This revision replaces an earlier, over-engineered build with direct PM2. The following workspace-owned files (no longer in the tree) are **removed** by the migration to this PRD:
 
-| Path | Was |
+| Role it played | Notes |
 | --- | --- |
-| `scripts/dev-pm2.sh` | A bespoke launcher with its own flag surface (`--host`, `--expose-debug`, `--frontend-only`, `--backend-only`, `--no-follow`, `--name`, `--env`), hash-derived names, per-deployment `PM2_HOME` isolation, a "last started" name file, and orphan-reaping logic. |
+| The pre-PM2 foreground shell supervisor | Process-group-based crash-linked supervision. Replaced by PM2. |
+| The bespoke PM2 launcher | A flag surface, hash-derived names, per-deployment `PM2_HOME` isolation, a "last started" name file, and orphan-reaping logic. Replaced by the self-deriving ecosystem. |
+| The backend entry shim | A PM2 file-path entry point for the agent-server. Retired in favor of pointing PM2's `script` at the venv `agent-server` console script directly. |
 
 ## Functional requirements
 
@@ -54,7 +56,7 @@ This revision replaces an earlier, over-engineered build with direct PM2. The fo
 
 ## Decision points
 
-- **Self-deriving ecosystem vs. a custom launcher script.** Chose the self-deriving ecosystem. A bespoke launcher (the prior `scripts/dev-pm2.sh`) accumulated a flag surface, hash-derived names, per-deployment `PM2_HOME` isolation, a "last started" name file, and orphan-reaping logic — far more machinery than the problem needs. Deriving role and identity inside `ecosystem.config.js` from path and `.dev-id` keeps one source of truth and lets PM2's own verbs do all the work.
+- **Self-deriving ecosystem vs. a custom launcher script.** Chose the self-deriving ecosystem. The earlier bespoke launcher accumulated a flag surface, hash-derived names, per-deployment `PM2_HOME` isolation, a "last started" name file, and orphan-reaping logic — far more machinery than the problem needs. Deriving role and identity inside `ecosystem.config.js` from path and `.dev-id` keeps one source of truth and lets PM2's own verbs do all the work.
 - **Role from path vs. an explicit `--role` flag.** Path is automatic and unambiguous for the `/opt` = prod convention; it cannot be forgotten on a start.
 - **`.dev-id` file vs. a derived/hash id.** A small explicit file is the clearest single source of truth, is unique per checkout, and survives `pm2 save` / `pm2 resurrect` (the id is read fresh each evaluation and baked into the snapshot). A hash of the path would also be unique but is opaque and harder to reason about for `pm2 logs backend-dev1`.
 - **Single shared PM2 registry + namespaces vs. per-deployment `PM2_HOME` isolation.** Chose shared + namespaces. The prior per-deployment `PM2_HOME` was over-isolation: it defeated PM2's group operations, required a custom wrapper to find the right registry, and made orphan reaping necessary. A single registry with `namespace` per instance gives `pm2 restart prod` / `pm2 stop dev2` for free and one `pm2 resurrect` to restore everything.
@@ -82,4 +84,4 @@ Preserve the requirements, not the implementation. If an upstream update breaks 
 
 ## Migration status
 
-This PRD describes the target design. The code is **not yet aligned**: the tree still contains the prior over-engineered build (`scripts/dev-pm2.sh`), a backend entry shim (`scripts/dev-agent-server.py`) that this revision retires in favor of the venv `agent-server` console script, and an `ecosystem.config.js` written for the old per-deployment-isolation model. Migrating the code to this PRD means rewriting `ecosystem.config.js` to the self-deriving form (path → role, `.dev-id` → id/ports/namespace, three apps including the ingress), deleting `scripts/dev-pm2.sh` and `scripts/dev-agent-server.py`, and reducing the `just dev` recipe to a thin `pm2 start ecosystem.config.js` wrapper. The ingress wrapper `scripts/dev-local-ingress.mjs` is **kept** (see `docs/prd/4_ingress-host-wrapper.md`). No code is changed by this PRD revision.
+Implemented. The ecosystem is the self-deriving form (path → role, `.dev-id` → id/ports/namespace, three apps including the ingress); the bespoke launcher, the pre-PM2 shell supervisor, and the backend entry shim have been removed; and the `just dev` recipe is a thin `pm2 start ecosystem.config.js` wrapper. The ingress wrapper `scripts/dev-local-ingress.mjs` is retained (see `docs/prd/4_ingress-host-wrapper.md`).
