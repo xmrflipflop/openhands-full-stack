@@ -7,34 +7,13 @@ set shell := ["bash", "-cu"]
 help:
     @just --list
 
-# Start the PM2-managed local dev stack (frontend + backend + ingress).
-# The ecosystem is self-deriving: role from the checkout path (/opt = prod,
-# else dev) and identity/ports from .dev-id; NODE_ENV is derived from role.
-# Run `uv sync` in the SDK package and `npm install` in the frontend package
-# first if the venv/node_modules are missing — see setup.
+# Start the local dev stack in the FOREGROUND: backend + frontend + ingress,
+# streamed logs, Ctrl-C stops everything. The ecosystem is self-deriving (role
+# from the checkout path, identity/ports from .dev-id; NODE_ENV from role).
+# pm2-runtime runs against a THROWAWAY PM2_HOME so the foreground dev run never
+# touches the global ~/.pm2 daemon (where prod lives). Run `just setup` first.
 dev *args:
-    pm2 start ecosystem.config.js {{args}}
-
-# Stop a whole instance by namespace (prod | devN), or all if none given.
-dev-stop tag='':
-    @if [ -n "{{tag}}" ]; then pm2 stop {{tag}}; else pm2 stop all; fi
-
-# Restart a whole instance by namespace, or all if none given.
-dev-restart tag='':
-    @if [ -n "{{tag}}" ]; then pm2 restart {{tag}}; else pm2 restart all; fi
-
-# Show the PM2 process table (grouped by namespace).
-dev-status:
-    pm2 ls
-
-# Tail logs: an app name (e.g. backend-dev1), a namespace (prod/devN), or
-# nothing for everything.
-dev-logs *args:
-    pm2 logs {{args}}
-
-# Snapshot the running set so `pm2 resurrect` restores it across restarts.
-dev-save:
-    pm2 save
+    PM2_HOME=/tmp/pm2-fg-openhands-dev pm2-runtime start ecosystem.config.js {{args}}
 
 # Bootstrap dependencies the ecosystem expects (run once per checkout).
 setup:

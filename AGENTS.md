@@ -174,18 +174,14 @@ The full stack runs strictly from this repository's sources, supervised by **PM2
 - **Frontend** — the Agent Canvas Vite dev server from `packages/agent-canvas` (`dev:frontend`), proxying `/api` to the local backend via `VITE_BACKEND_HOST`.
 - **Ingress** — the whole stack behind one origin, routing API/websocket paths to the backend and everything else to the frontend, so the browser makes same-origin calls. Runs via `scripts/dev-local-ingress.mjs` (see `docs/prd/4_ingress-host-wrapper.md`), a thin wrapper that reuses the upstream proxy internals unmodified and adds only a bind address. Everything binds loopback by default; expose a service by setting `DEV_<service>_BIND`.
 
-PM2 supervises each service with bounded auto-restart (`max_restarts`, `min_uptime`, `restart_delay`) and a `max_memory_restart` threshold. Apps are grouped by namespace, so group verbs (`pm2 restart prod`, `pm2 stop dev2`) and single-app verbs (`pm2 logs backend-dev1`) both work. The id is read fresh on every PM2 evaluation and baked into `pm2 save` snapshots, so `pm2 resurrect` restores prod and all dev instances with the correct ports. `NODE_ENV` is derived from role (prod → `production`, dev → `development`); there are no named env blocks. The stack runs unprivileged; it binds no port below 1024 and writes only to workspace-owned, gitignored trees.
+PM2 supervises each service with bounded auto-restart (`max_restarts`, `min_uptime`, `restart_delay`) and a `max_memory_restart` threshold. `NODE_ENV` is derived from role (prod → `production`, dev → `development`); there are no named env blocks. The stack runs unprivileged; it binds no port below 1024 and writes only to workspace-owned, gitignored trees.
 
 ```sh
 just setup                             # uv sync + npm install (once per checkout)
-just dev                               # pm2 start ecosystem.config.js
-just dev-status                        # pm2 ls (grouped by namespace)
-just dev-logs backend-dev1             # tail one app (or a namespace, or everything)
-just dev-restart dev1                  # restart a whole instance by namespace
-just dev-stop dev1                     # stop a whole instance by namespace
-just dev-save                          # pm2 save (snapshot for pm2 resurrect)
-pm2 resurrect                          # restore the saved set across a machine restart
+just dev                               # foreground: pm2-runtime + throwaway PM2_HOME
 ```
+
+`just dev` runs the stack in the foreground via `pm2-runtime` against a throwaway `PM2_HOME` (`/tmp/pm2-fg-openhands-dev`), so the dev run never touches the global `~/.pm2` daemon. Logs stream to the terminal; Ctrl-C stops the whole stack; there is no dev state to manage, save, or resurrect, so there are no dev-specific stop/restart/status/logs/save recipes. The detached prod lifecycle (`pm2 start` + `pm2 save` + `pm2 resurrect`) is a prod concern and is documented in `README.md`, not here.
 
 Unlike upstream, the stack never fetches the agent-server via `uvx` from PyPI and never installs the published `@openhands/agent-canvas` package. The OpenHands Automation backend is intentionally not started: that project is not vendored in this repository. Do not "fix" the stack by pointing it at upstream releases; it exists to exercise the local subtrees.
 
