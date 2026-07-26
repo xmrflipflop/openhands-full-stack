@@ -42,6 +42,8 @@ Workspace-owned; no upstream files are modified.
 
 Behavioral only; no upstream code is modified. The divergence exists solely because upstream binds the ingress to all interfaces with no host option. A `--host` option on the upstream ingress would be a reasonable contribution and would retire this wrapper.
 
+The wrapper also carries half of the same-origin contract owned by `docs/prd/1_local-dev-launcher.md` (FR8a/FR9): it is the path that answers the browser's same-origin `/api` and `/sockets` calls when the browser arrives through the ingress port, forwarding them to the backend's loopback port on the server. If the wrapper is retired (e.g. upstream gains a `--host` option and the ecosystem points directly at the upstream ingress), the replacement must still forward that same prefix set to the backend, or the FR8a same-origin promise breaks.
+
 ## Conflict resolution notes
 
 Preserve the requirement, not the implementation. If the upstream ingress gains a host/bind option, retire the wrapper and point the ecosystem at the upstream script directly. If the upstream proxy internals move or change their import surface, rewire the wrapper's imports; the bind-address addition is the only stable workspace concern.

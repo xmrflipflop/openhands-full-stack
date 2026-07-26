@@ -57,6 +57,8 @@
 
 const fs = require("node:fs");
 const path = require("node:path");
+const os = require("node:os");
+const { randomBytes } = require("node:crypto");
 
 const repoRoot = __dirname;
 const SDK_DIR = path.join(repoRoot, "packages", "software-agent-sdk");
@@ -119,17 +121,44 @@ const backendRoutes = [
 ];
 
 // ── Shared env applied to every app (all env modes) ──────────────────────────
-// The session API key is injected via env (LOCAL_BACKEND_API_KEY) or read from
-// the gitignored persisted key file; never committed.
-const apiKeyFile = path.join(repoRoot, ".pm2-runtime", "dev-local-api-key");
-let apiKey = process.env.LOCAL_BACKEND_API_KEY || "";
-if (!apiKey) {
+// Session API key shared by every app. Guaranteed non-empty: an explicit
+// LOCAL_BACKEND_API_KEY takes precedence; otherwise the launcher reads a key
+// persisted to ~/.openhands/agent-canvas/dev-local-api-key (the home dir, so
+// the key is stable across `just dev` restarts and shared with the published
+// `agent-canvas` CLI and the predecessor shell launcher); if that file is
+// missing or empty the launcher generates a fresh 64-hex-char (256-bit) key
+// and persists it. This mirrors upstream's getOrCreatePersistedApiKeyFile()
+// so the frontend never has to collect a key from the user: a non-empty
+// VITE_SESSION_API_KEY is what lets makeDefaultLocalBackend() seed the
+// backend registry and skip the "configure a backend" onboarding prompt
+// (docs/prd/1_local-dev-launcher.md FR8b). The key file is mode 0600
+// (credential) and lives under a home path that is never committed.
+const persistedKeyPath =
+  process.env.OH_SESSION_API_KEY_PATH ||
+  path.join(os.homedir(), ".openhands", "agent-canvas", "dev-local-api-key");
+function getOrCreateSessionApiKey() {
+  const fromEnv = (process.env.LOCAL_BACKEND_API_KEY || "").trim();
+  if (fromEnv) return fromEnv;
+
   try {
-    apiKey = fs.readFileSync(apiKeyFile, "utf8").trim();
+    const persisted = fs.readFileSync(persistedKeyPath, "utf8").trim();
+    if (persisted) return persisted;
   } catch {
-    apiKey = "";
+    /* file absent — fall through to generation */
   }
+
+  const generated = randomBytes(32).toString("hex");
+  fs.mkdirSync(path.dirname(persistedKeyPath), { recursive: true });
+  // Write under a restrictive umask so the key file is mode 0600 (credential).
+  const prevMask = process.umask(0o177);
+  try {
+    fs.writeFileSync(persistedKeyPath, generated, { mode: 0o600 });
+  } finally {
+    process.umask(prevMask);
+  }
+  return generated;
 }
+const apiKey = getOrCreateSessionApiKey();
 const sharedEnv = {
   PYTHONUTF8: "1",
   DEV_REPO_ROOT: repoRoot,
