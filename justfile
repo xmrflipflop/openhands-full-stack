@@ -21,6 +21,7 @@ dev *args:
 # See docs/prd/5_devid-worktree-allocation.md.
 setup:
     ./scripts/alloc-dev-id.sh
+    npm install pm2 -g
     cd packages/software-agent-sdk && uv sync
     cd packages/agent-canvas && npm install
 
