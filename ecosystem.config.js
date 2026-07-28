@@ -40,14 +40,18 @@
  *             (FR8/FR8c):
  *               • development → `react-router dev` (Vite dev server). Its dev
  *                 proxy targets the backend via VITE_BACKEND_HOST. (FR8 dev)
- *               • production  → upstream `scripts/static-server.mjs` serving
- *                 the prebuilt SPA from packages/agent-canvas/build/ with
- *                 history-mode SPA fallback. Its own reverse proxy forwards
- *                 the same /api,/sockets,… prefix set as the ingress, so the
- *                 production frontend port behaves like Vite's dev server. The
- *                 resolved session key is injected into the served index.html
- *                 at runtime via --session-api-key (not baked into the build),
- *                 preserving FR8b for the served bundle. (FR8 prod)
+ *               • production  → workspace wrapper
+ *                 `scripts/prod-frontend-server.mjs` (PM2 entry shim) which
+ *                 imports `parseArgs` + `startStaticServer` from upstream
+ *                 `packages/agent-canvas/scripts/static-server.mjs`. The
+ *                 upstream script guards its entry behind an `isMainModule`
+ *                 check that fails under PM2 fork mode, so the wrapper runs
+ *                 the exported functions directly. Serves the prebuilt SPA
+ *                 from packages/agent-canvas/build/ with history-mode fallback.
+ *                 Its reverse proxy forwards the same /api,/sockets,… prefix
+ *                 set as the ingress. The session key is injected at runtime
+ *                 via --session-api-key (not baked into the build), preserving
+ *                 FR8b. (FR8 prod)
  *   ingress   Workspace-owned single-origin proxy (scripts/dev-local-ingress.mjs)
  *             reusing the upstream reverse-proxy internals unmodified, with a
  *             bind address added so the stack port can stay loopback by
@@ -74,15 +78,17 @@ const CANVAS_DIR = path.join(repoRoot, "packages", "agent-canvas");
 const UV_VENV_PYTHON = path.join(SDK_DIR, ".venv", "bin", "python");
 const AGENT_SERVER_SCRIPT = path.join(SDK_DIR, ".venv", "bin", "agent-server");
 const INGRESS_SCRIPT = path.join(repoRoot, "scripts", "dev-local-ingress.mjs");
-// Upstream's static file server + reverse proxy. Production serves the
-// prebuilt SPA from packages/agent-canvas/build/ through this script
-// (history-mode SPA fallback + /api,/sockets,… prefix proxy + runtime
-// session-key injection). Not a workspace patch: the ecosystem only consumes
-// this upstream seam. (FR8 prod.)
-const STATIC_SERVER_SCRIPT = path.join(
-  CANVAS_DIR,
+// Workspace-owned PM2 entry shim for the upstream static server.
+// Upstream's `scripts/static-server.mjs` guards its entry behind an
+// `isMainModule` check which fails under PM2 fork mode (PM2's wrapper sets
+// process.argv[1] to the fork harness, not the user script). This wrapper
+// imports `parseArgs` + `startStaticServer` from the upstream script and runs
+// them directly. The args/env remain identical to a direct `node` run.
+// (FR8 prod, docs/prd/1_local-dev-launcher.md §8.)
+const PROD_FRONTEND_SCRIPT = path.join(
+  repoRoot,
   "scripts",
-  "static-server.mjs",
+  "prod-frontend-server.mjs",
 );
 const CANVAS_BUILD_DIR = path.join(CANVAS_DIR, "build");
 
@@ -208,7 +214,7 @@ const frontendApp = isProductionNodeEnv
       name: `frontend-${tag}`,
       namespace,
       cwd: CANVAS_DIR,
-      script: STATIC_SERVER_SCRIPT,
+      script: PROD_FRONTEND_SCRIPT,
       interpreter: "node",
       args: [
         `--dir ${CANVAS_BUILD_DIR}`,
