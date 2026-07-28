@@ -45,7 +45,8 @@ This repository is an integration workspace for two canonical OpenHands projects
 | `docker/compose.yaml` | Workspace local-service orchestration |
 | `scripts/` | Repeatable development, CI, and maintenance commands |
 | `scripts/dev-local-ingress.mjs` | Workspace-owned single-origin ingress wrapper (the third PM2 app); adds a bind address to the upstream ingress (see `docs/prd/4_ingress-host-wrapper.md`) |
-| `ecosystem.config.js` | Committed PM2 process ecosystem; self-deriving (role from path, identity/ports from `.dev-id`) |
+| `scripts/launch-stack.js` | The only supported entry point for the stack; resolves every deployment-specific value (id, tag, ports, binds, session key, `NODE_ENV`) and hands it to PM2 via the ecosystem (see `docs/prd/1_local-dev-launcher.md`) |
+| `ecosystem.config.js` | Committed PM2 process ecosystem; a pure consumer that derives nothing — it reads `STACK_*` env vars set by the launcher and hard-errors (naming the launcher) if any required value is absent |
 | `infra/` | Deployment and infrastructure configuration |
 | `docs/` | Documentation for this combined workspace |
 | `docs/prd/` | One PRD per workspace functionality: requirements, decisions, assumptions, upstream divergence |
@@ -114,6 +115,7 @@ File references rot when files move; requirements do not. Handle the mismatch wi
 - **PRD numbers and slugs are stable identifiers.** Never rename a PRD file: mark it superseded (naming the successor) and create the new one under the next unused number. Everything may point at a PRD filename forever.
 - **Paths appear in exactly one place per PRD.** Repository paths belong only in the Scope table; everywhere else refer to components by role ("the launcher", "the ingress runner"). A file move then touches one table row, and prose never rots.
 - **Drift is checked mechanically, not by discipline.** `scripts/check-prd-refs.sh` validates both directions: every path an active PRD references exists, every PRD referenced from code exists, and every marker names its PRD. Run it in the Validation step and in CI so a rename fails immediately, while the author still has the context to fix it.
+- **PRDs are development artifacts, not runtime content.** PRD filenames, requirement numbers (FR1, FR8c, NFR6, etc.), and the phrase "PRD" must never appear in user-facing output: error messages, console output, log lines, CLI help text, or any string that a developer running the stack would see. PRD references belong in code comments and `docs/prd/` files only. If an error message needs to explain *why* something must happen, rephrase it as the reason itself — never as a requirement number.
 
 ## Package development
 
@@ -150,7 +152,7 @@ Run the SDK's documented setup, format, lint, type-check, and test commands from
 
 Workspace-level tasks are run with `just` (https://github.com/casey/just) from the repository root. Running `just` with no arguments lists every recipe; that listing, not this document, is the authoritative catalogue. The stable command names:
 
-- `just dev [flags]` — start the local stack; flags pass through to the launcher unchanged (e.g. `just dev --host 0.0.0.0`).
+- `just serve [flags]` — start the local stack; flags pass through to `scripts/launch-stack.js` unchanged (e.g. `just serve --ingress_bind 0.0.0.0`).
 - `just lint` — workspace linters, including the PRD reference check.
 - `just test` — workspace tests.
 - `just check` — `lint` + `test`; run before declaring work complete.
@@ -166,22 +168,25 @@ Rules for the justfile:
 
 ## Local development launcher
 
-The full stack runs strictly from this repository's sources, supervised by **PM2** through one committed `ecosystem.config.js`. The ecosystem is **self-deriving**: there is no launcher script and no per-invocation flag surface — it computes every deployment-specific value from where the repo is checked out.
+The full stack runs strictly from this repository's sources, supervised by **PM2**. There is one launcher — `scripts/launch-stack.js`, the only supported entry point — and one committed `ecosystem.config.js` that consumes it. The launcher resolves every deployment-specific value and hands it to the ecosystem as `STACK_*` environment variables; the ecosystem **derives nothing** (it reads those vars and hard-errors, naming the launcher, if any required value is absent).
 
-- **Role from path.** A checkout under `/opt` is **prod** (id 0, base ports); anywhere else is **dev**. The prod checkout is the deployment signal in the Coder setup.
-- **Identity from `.dev-id`.** Each dev checkout carries a `.dev-id` file (gitignored) holding a unique positive integer. The id is the single source of truth for the app-name tag (`prod` or `dev<N>`), the PM2 `namespace`, and the port block (frontend/backend/ingress step by 10 per id). A missing or invalid `.dev-id` for a non-prod checkout fails fast — no silent port clash.
+- **`.dev-id` for every checkout.** Every checkout — production included — carries a `.dev-id` file (gitignored) holding a unique positive integer. The launcher validates it (never allocates); a missing or invalid `.dev-id` aborts the launch. Allocation is automated in `just setup` (see `docs/prd/5_devid-worktree-allocation.md`).
+- **Tag from mode + id.** The tag is `dev-<id>` or `prod-<id>`, used verbatim as the PM2 app-name suffix (`backend-dev-1`, `frontend-prod-2`, …) and the `namespace`. Mode comes from `--production`; the id always embeds.
+- **Mode is independent of environment; both axes are free.** Mode (`--production` or not) selects `NODE_ENV` and the frontend serving seam; run style (`--background` or not) selects foreground `pm2-runtime` vs. detached `pm2` against the shared daemon. All four combinations are legal. (Note the runner mapping: `pm2-runtime` is the **foreground** runner; `pm2 start` detaches.)
+- **Ports.** Default ports are `base + id×10`, plus 5 for production (bases 3000 / 18000 / 9000 for frontend / backend / ingress). The production offset moves prod off the round numbers so a dev and a prod of the same id never collide; the step (10) must stay larger than the offset (5). Each of the six ports defaults independently (`--fe_port` etc. override).
 - **Backend** — the OpenHands Agent Server from `packages/software-agent-sdk`. PM2's `script` points at the venv's installed `agent-server` console script (`packages/software-agent-sdk/.venv/bin/agent-server`) with that venv's Python as `interpreter`. `uv sync` materialises the venv with workspace members in editable mode (workspace sources only; never `openhands-*` from PyPI).
-- **Frontend** — the Agent Canvas Vite dev server from `packages/agent-canvas` (`dev:frontend`), proxying `/api` to the local backend via `VITE_BACKEND_HOST`.
-- **Ingress** — the whole stack behind one origin, routing API/websocket paths to the backend and everything else to the frontend, so the browser makes same-origin calls. Runs via `scripts/dev-local-ingress.mjs` (see `docs/prd/4_ingress-host-wrapper.md`), a thin wrapper that reuses the upstream proxy internals unmodified and adds only a bind address. Everything binds loopback by default; expose a service by setting `DEV_<service>_BIND`.
+- **Frontend** — the Agent Canvas from `packages/agent-canvas`. The serving seam keys off `NODE_ENV` (this is the only conditional the ecosystem contains, plus its production build preflight): development runs the Vite dev server (`dev:frontend`), proxying `/api` to the local backend via `VITE_BACKEND_HOST`; production serves the prebuilt bundle through the upstream static server (`--session-api-key` injects the resolved session key at runtime). The split exists because the Vite dev server cannot run under `NODE_ENV=production`.
+- **Ingress** — the whole stack behind one origin, routing API/websocket paths to the backend and everything else to the frontend, so the browser makes same-origin calls. Runs via `scripts/dev-local-ingress.mjs` (see `docs/prd/4_ingress-host-wrapper.md`), a thin wrapper that reuses the upstream proxy internals unmodified and adds only a bind address.
+- **Binds** — launcher-owned, one per service, defaulting to loopback (`127.0.0.1`). Loopback is a security property (the stack is unauthenticated by default), so exposing it stays opt-in and explicit: flag, then the legacy `DEV_<service>_BIND` env (kept for continuity), then loopback. The ecosystem no longer reads `DEV_*_BIND` and applies no default of its own.
 
-PM2 supervises each service with bounded auto-restart (`max_restarts`, `min_uptime`, `restart_delay`) and a `max_memory_restart` threshold. `NODE_ENV` is derived from role (prod → `production`, dev → `development`); there are no named env blocks. The stack runs unprivileged; it binds no port below 1024 and writes only to workspace-owned, gitignored trees.
+PM2 supervises each service with bounded auto-restart (`max_restarts`, `min_uptime`, `restart_delay`, `kill_timeout`) and a `max_memory_restart` threshold. `NODE_ENV` comes from `--production` (defaults to development) and is set on all three apps. The stack runs unprivileged; it binds no port below 1024 and writes only to workspace-owned, gitignored trees.
 
 ```sh
 just setup                             # uv sync + npm install (once per checkout)
-just dev                               # foreground: pm2-runtime + throwaway PM2_HOME
+just serve                             # foreground: pm2-runtime + throwaway PM2_HOME
 ```
 
-`just dev` runs the stack in the foreground via `pm2-runtime` against a throwaway `PM2_HOME` (`/tmp/pm2-fg-openhands-dev`), so the dev run never touches the global `~/.pm2` daemon. Logs stream to the terminal; Ctrl-C stops the whole stack; there is no dev state to manage, save, or resurrect, so there are no dev-specific stop/restart/status/logs/save recipes. The detached prod lifecycle (`pm2 start` + `pm2 save` + `pm2 resurrect`) is a prod concern and is documented in `README.md`, not here.
+`just serve` runs the launcher, which starts the stack in the foreground via `pm2-runtime` against a throwaway `PM2_HOME` keyed on the tag (`/tmp/pm2-fg-<tag>`), so the foreground run never touches the global `~/.pm2` daemon. Logs stream to the terminal; Ctrl-C stops the whole stack; there is no state to manage, save, or resurrect. `--background` detaches against the shared daemon instead. Snapshot/restore (`pm2 save` / `pm2 resurrect`) is intentionally **not** supported: a restored snapshot would replay stale resolved values and persist the session key to disk; restart by re-running `just serve`.
 
 Unlike upstream, the stack never fetches the agent-server via `uvx` from PyPI and never installs the published `@openhands/agent-canvas` package. The OpenHands Automation backend is intentionally not started: that project is not vendored in this repository. Do not "fix" the stack by pointing it at upstream releases; it exists to exercise the local subtrees.
 

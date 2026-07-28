@@ -47,53 +47,67 @@ A normal clone is sufficient. Do not run `git submodule init` or `git submodule 
 
 **Prerequisites**: [`just`](https://github.com/casey/just), [`pm2`](https://pm2.keymetrics.io/) (v7+), Node.js 22.12+, `npm`, [`uv`](https://docs.astral.sh/uv/)
 
-The stack runs strictly from this repository's sources (no upstream releases are downloaded), supervised by PM2 through one committed `ecosystem.config.js`. The ecosystem is **self-deriving**: it reads the checkout's role and identity from the filesystem and computes app names, ports, and namespace from them — there is no launcher script.
+The stack runs strictly from this repository's sources (no upstream releases are downloaded), supervised by PM2. There is one launcher — `scripts/launch-stack.js`, the only supported entry point — and one committed `ecosystem.config.js` that consumes the launcher's output. The launcher resolves every deployment-specific value (the per-checkout id, the app-name tag, ports, bind addresses, the session API key, `NODE_ENV`) and hands them to the ecosystem as `STACK_*` environment variables; the ecosystem derives nothing and hard-errors (naming the launcher) if any required value is absent. Start the stack with `just serve`, which forwards all flags to the launcher unchanged.
 
-- A checkout under `/opt` is **prod** (base ports); anywhere else is **dev**.
-- Each dev checkout needs a `.dev-id` file (gitignored) holding a unique positive integer, e.g. `echo 1 > .dev-id`. That id derives the port block, app-name tag (`dev1`, `dev2`, …), and PM2 namespace, so concurrent checkouts never clash. (Prod uses id `0` and needs no `.dev-id`.)
-- The frontend is served differently per role: **dev** runs the Vite dev server (`react-router dev`); **prod** serves a prebuilt production bundle through the upstream static file server. The split exists because the Vite dev server cannot run under `NODE_ENV=production` (Vite's SSR JSX transform then imports a runtime that has no `jsxDEV` export, crashing the dev server). Prod requires the bundle to be built first via `just setup --prod`; the prod launcher fails fast with a clear message if it is missing.
+Key points:
 
-| Service | Prod | dev1 | dev2 | Purpose |
-| --- | --- | --- | --- | --- |
-| Stack (ingress) | `:9000` | `:9010` | `:9020` | Single-origin entry point — browse here |
-| Frontend | `:3000` (static server + built SPA) | `:3010` (Vite dev server) | `:3020` (Vite dev server) | Direct frontend port, for debugging |
-| Backend (agent-server) | `:18000` | `:18010` | `:18020` | Direct API port, for debugging (`/docs`) |
+- Every checkout — production included — needs a `.dev-id` file (gitignored) holding a unique positive integer. `just setup` allocates one automatically (idempotent). The id embeds in the tag and the port block for both modes.
+- The stack has two **independent** axes. **Mode** (`--production` or not) selects `NODE_ENV` and the frontend serving seam. **Run style** (`--background` or not) selects foreground `pm2-runtime` (default) vs. detached `pm2` against the shared daemon. All four combinations are legal.
+- Tag shape is `dev-<id>` or `prod-<id>`, used verbatim as the PM2 app-name suffix and namespace (e.g. `backend-dev-1`, `frontend-prod-2`). This is a breaking rename from the earlier `dev1` / `prod` shape.
+- Default ports (bases 3000 / 18000 / 9000 for frontend / backend / ingress) are `base + id×10`, plus 5 for production (so a dev and a prod of the same id never collide). Each of the six ports defaults independently; pass `--fe_port` / `--be_port` / `--ingress_port` to override.
+- Bind addresses default to loopback (`127.0.0.1`) for every service. Loopback is a security property, not a convenience: the stack is unauthenticated by default, so exposing it must stay opt-in and explicit. Override via the `--fe_bind` / `--be_bind` / `--ingress_bind` flags, or the legacy `DEV_FRONTEND_BIND` / `DEV_BACKEND_BIND` / `DEV_INGRESS_BIND` env vars (kept for continuity with existing shell profiles).
+- The frontend is served differently per **mode**: development runs the Vite dev server (`react-router dev`); production serves a prebuilt bundle through the upstream static file server. The split exists because the Vite dev server cannot run under `NODE_ENV=production` (Vite's SSR JSX transform then imports a runtime that has no `jsxDEV` export, crashing the dev server). Production requires the bundle to be built first via `just setup --production`; the launcher (and the ecosystem, as a backstop) fail fast with a clear message if it is missing.
 
-### Dev (foreground)
+| Service | dev-1 | prod-1 | Purpose |
+| --- | --- | --- | --- |
+| Stack (ingress) | `:9010` | `:9015` | Single-origin entry point — browse here |
+| Frontend | `:3010` (Vite dev server) | `:3015` (static server + built SPA) | Direct frontend port, for debugging |
+| Backend (agent-server) | `:18010` | `:18015` | Direct API port, for debugging (`/docs`) |
+
+### Foreground (default)
 
 ```bash
-just setup            # uv sync + npm install (once per checkout)
-just dev              # foreground: backend + frontend + ingress, logs stream, Ctrl-C stops all
+just setup            # uv sync + npm install (allocates .dev-id, once per checkout)
+just serve            # foreground: backend + frontend + ingress, logs stream, Ctrl-C stops all
 ```
 
-`just dev` runs `pm2-runtime` in the foreground against a throwaway `PM2_HOME` (`/tmp/pm2-fg-openhands-dev`), so the dev run never touches the global `~/.pm2` daemon. Logs stream to the terminal; Ctrl-C stops the whole stack; there is no state to manage, save, or resurrect. Everything binds loopback by default — to reach a service from another machine, set its bind env before starting, e.g. `DEV_INGRESS_BIND=0.0.0.0 just dev`.
+`just serve` runs the launcher, which starts `pm2-runtime` in the foreground against a throwaway `PM2_HOME` keyed on the tag (`/tmp/pm2-fg-<tag>`), so the foreground run never touches the global `~/.pm2` daemon. Logs stream to the terminal; Ctrl-C stops the whole stack; there is no state to manage, save, or resurrect. To reach a service from another machine, pass the bind flag, e.g. `just serve --ingress_bind 0.0.0.0`.
 
 The OpenHands Automation backend is not part of this repository and is not started.
 
-### Production (detached)
+### Background / production
 
-For a production deployment, clone the repository under `/opt` (the path is the prod signal) and run against the **global** PM2 daemon so the stack survives the operator disconnecting and restarts across machine reboots. Prod serves a **prebuilt** frontend bundle, so the one-time setup also builds it:
-
-```bash
-git clone <repo-url> /opt/openhands
-cd /opt/openhands
-just setup --prod                  # uv sync + npm install, then build the agent-canvas production bundle (one-time)
-pm2 start ecosystem.config.js      # detached, on the global daemon (~/.pm2)
-```
-
-`just setup --prod` writes the bundle to `packages/agent-canvas/build/` (gitignored, never committed). If you change the frontend source, rebuild with `just setup --prod` (or `cd packages/agent-canvas && npm run build`) before restarting the stack; starting prod without a build fails fast with a message pointing here. (Dev checkouts never need the build — plain `just setup` skips it.)
-
-Then manage it with PM2's own verbs:
+For a deployment (or any detached run), add `--background` to run against the **global** PM2 daemon so the stack survives the operator disconnecting. Add `--production` to serve the **prebuilt** frontend bundle under `NODE_ENV=production`; `just setup --production` builds it first (one-time, or whenever the frontend source changes):
 
 ```bash
-pm2 ls                           # process table (grouped by namespace)
-pm2 logs backend-prod            # one app, or `pm2 logs prod` for the whole namespace
-pm2 save                         # snapshot the running set
-pm2 resurrect                    # restore the saved set after a machine restart
-pm2 stop prod && pm2 delete prod # tear down the prod instance
+just setup --production                   # uv sync + npm install, then build the agent-canvas production bundle (one-time)
+just serve --production --background   # detached, on the global daemon (~/.pm2)
 ```
 
-Run `pm2 save` whenever the set of running instances changes, so `pm2 resurrect` restores exactly what you expect.
+`just setup --production` writes the bundle to `packages/agent-canvas/build/` (gitignored, never committed). If you change the frontend source, rebuild with `just setup --production` (or `cd packages/agent-canvas && npm run build`) before restarting the stack; starting production without a build fails fast with a message pointing here.
+
+Then manage it with PM2's own verbs (grouped by the tag namespace):
+
+```bash
+pm2 ls                                # process table (grouped by namespace)
+pm2 logs backend-prod-1               # one app, or a whole namespace
+pm2 stop prod-1 && pm2 delete prod-1   # tear down that instance
+```
+
+Snapshot/restore (`pm2 save` / `pm2 resurrect`) is intentionally **not** supported: a restored snapshot would replay the resolved values from the moment it was taken, and the launcher resolves values fresh on every start. There is no resurrect handling; there is no reboot-survival path. Restart by re-running `just serve`.
+
+### Flags
+
+`just serve` forwards everything to `scripts/launch-stack.js`:
+
+| Flag | Effect |
+| --- | --- |
+| `--fe_port` / `--be_port` / `--ingress_port` | Override one of the three ports (default each computes from the id). Out of 1024–65535 or non-integer is a hard error. |
+| `--fe_bind` / `--be_bind` / `--ingress_bind` | Override one of the three bind addresses (default loopback; then `DEV_*_BIND` env). |
+| `--background` | Detach: `pm2 start` against the shared daemon (default is foreground `pm2-runtime`). |
+| `--production` | `NODE_ENV=production`, serve the prebuilt SPA, require the build to exist. |
+| `--dry-run` | Print the resolved env and intended runner; start nothing. |
+
 
 ## Workspace tasks
 
@@ -101,8 +115,9 @@ Run `just` with no arguments to list all recipes. The common ones:
 
 ```bash
 just setup           # bootstrap deps (alloc .dev-id, uv sync, npm install) — once per checkout
-just setup --prod    # same, plus build the agent-canvas production bundle (needed for prod role only)
-just dev             # start the local stack in the foreground (frontend + backend + ingress)
+just setup --production    # same, plus build the agent-canvas production bundle (needed for production mode only)
+just serve           # start the local stack in the foreground (frontend + backend + ingress)
+just serve --background   # detach: leave the stack running on the shared daemon
 just lint            # workspace linters, incl. the PRD reference check
 just test            # workspace tests
 just check           # lint + test — run before pushing
@@ -110,7 +125,7 @@ just setup-remotes   # set up the upstream git remotes
 just sync            # pull both upstream subtrees
 ```
 
-`just dev` runs `pm2-runtime` in the foreground against a throwaway `PM2_HOME`, so the dev run never touches the global `~/.pm2` daemon. Role (prod under `/opt`, dev elsewhere) derives `NODE_ENV` and the port block, and a unique PM2 namespace per checkout keeps concurrent checkouts from colliding. The dev role runs the Vite dev server; the prod role serves a prebuilt bundle (`just setup --prod` builds it), because the Vite dev server cannot run under `NODE_ENV=production`.
+`just serve` forwards all flags to `scripts/launch-stack.js`, which resolves the per-checkout id, tag, ports, bind addresses, session key, and `NODE_ENV`, then hands them to `ecosystem.config.js`. The default foreground run uses `pm2-runtime` with a throwaway `PM2_HOME` keyed on the tag, so it never touches the global `~/.pm2` daemon; `--background` detaches against the shared daemon instead. Mode is independent of run style: `--production` selects `NODE_ENV=production` and serves a prebuilt bundle (`just setup --production` builds it), because the Vite dev server cannot run under `NODE_ENV=production`.
 
 ## Develop
 

@@ -7,34 +7,49 @@ set shell := ["bash", "-cu"]
 help:
     @just --list
 
-# Start the local dev stack in the FOREGROUND: backend + frontend + ingress,
-# streamed logs, Ctrl-C stops everything. The ecosystem is self-deriving (role
-# from the checkout path, identity/ports from .dev-id; NODE_ENV from role).
-# pm2-runtime runs against a THROWAWAY PM2_HOME so the foreground dev run never
-# touches the global ~/.pm2 daemon (where prod lives). Run `just setup` first.
-dev *args:
-    PM2_HOME=/tmp/pm2-fg-openhands-dev pm2-runtime start ecosystem.config.js {{args}}
+# Start the local stack in the FOREGROUND (default): backend + frontend +
+# ingress, streamed logs, Ctrl-C stops everything. Forwards all flags unchanged
+# to scripts/launch-stack.js (the only supported entry point), which resolves
+# every deployment value (per-checkout id, tag, ports, binds, session key,
+# NODE_ENV) and hands them to ecosystem.config.js as STACK_* env vars.
+# Foreground runs `pm2-runtime` against a THROWAWAY PM2_HOME keyed on the tag,
+# so the run never touches the global ~/.pm2 daemon. Pass --background to detach
+# against the shared daemon instead, and --production to serve the prebuilt SPA.
+# Run `just setup` first.
+serve *args:
+    node scripts/launch-stack.js {{args}}
 
-# Bootstrap dependencies the ecosystem expects (run once per checkout).
-# Allocates the per-checkout `.dev-id` first so the dev stack can derive a
-# unique app-name tag and port block (idempotent; supports git worktrees).
+# Kill all background stack processes for this checkout.
+# Reads .dev-id and deletes both dev-<id> and prod-<id> PM2 namespaces from
+# the shared daemon. Idempotent (exits 0 if nothing was running). Works
+# across branch switches because .dev-id is stable (gitignored).
+# Pass --kill directly to the launcher; all other flags are ignored by --kill.
+kill *args:
+    node scripts/launch-stack.js --kill {{args}}
+
+# Bootstrap dependencies the stack expects (run once per checkout).
+# Allocates the per-checkout `.dev-id` first so the launcher can derive a unique
+# app-name tag (dev-<id>/prod-<id>) and port block (idempotent; supports git
+# worktrees). Every checkout — production included — needs a `.dev-id` now.
 # See docs/prd/5_devid-worktree-allocation.md.
 #
-# Pass `--prod` to additionally build the Agent Canvas production bundle into
-# packages/agent-canvas/build/. The prod launcher serves this prebuilt SPA
-# (NODE_ENV=production is incompatible with `react-router dev`, so prod does
-# NOT run the Vite dev server — see ecosystem.config.js and
-# docs/prd/1_local-dev-launcher.md FR8). Dev checkouts never need `--prod`.
-[arg("prod", value="true")]
-setup prod="false":
+# Pass `--production` to additionally build the Agent Canvas production bundle
+# into packages/agent-canvas/build/. The production launcher serves this
+# prebuilt SPA (NODE_ENV=production is incompatible with `react-router dev`, so
+# production does NOT run the Vite dev server — see ecosystem.config.js and
+# docs/prd/1_local-dev-launcher.md FR8). The flag name matches the launcher's
+# `--production` (and `just serve`'s) so the surface is uniform. Dev-mode
+# checkouts never need `--production`.
+[arg("production", long, value="true")]
+setup production="false":
     ./scripts/alloc-dev-id.sh
     cd packages/software-agent-sdk && uv sync
     cd packages/agent-canvas && npm install
-    if [ "{{prod}}" = "true" ]; then \
-        echo "→ --prod: building agent-canvas production bundle (npm run build:app)"; \
+    if [ "{{production}}" = "true" ]; then \
+        echo "→ --production: building agent-canvas production bundle (npm run build)"; \
         npm run build --prefix packages/agent-canvas; \
     else \
-        echo "→ skipping production frontend build (dev checkout; pass --prod to build it)"; \
+        echo "→ skipping production frontend build (dev mode; pass --production to build it)"; \
     fi
 
 # Run lint and test
