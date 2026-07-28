@@ -19,6 +19,7 @@ Workspace-owned only; no upstream files are modified.
 
 - **FR1** — Running the task runner with no arguments lists the available tasks; the listing is the authoritative catalogue (documentation points to it rather than duplicating it).
 - **FR2** — `dev` starts the local stack, passing all trailing flags through to the launcher unchanged.
+- **FR2a** — `setup` bootstraps the dependencies the ecosystem expects (allocates the per-checkout `.dev-id`, runs `uv sync` for the SDK and `npm install` for the frontend). It additionally accepts a `--prod` flag (`[arg("prod", value="true")] setup prod="false"`) that, when set, builds the Agent Canvas production bundle (the artifact the prod launcher serves); without it the build is skipped so dev checkouts pay no build cost. This is the one workspace task that is aware of role: it produces the artifact consumed by the prod serving path (`docs/prd/1_local-dev-launcher.md` FR8 prod, FR13b). `--prod` is the only flag `setup` honours; other arguments are ignored.
 - **FR3** — `lint` runs the workspace linters, including the PRD reference check; `test` runs workspace tests; `check` runs both and is the pre-completion gate.
 - **FR4** — Every script a recipe wraps remains directly runnable without the task runner; the runner is a convenience, never a dependency.
 - **FR5** — Recipes may inline shortcuts: short, linear command sequences for repeatable workflows (e.g. `git subtree` syncs against the upstream remotes). The recipe body itself then serves as the canonical, executable record of that workflow.
@@ -33,10 +34,11 @@ Workspace-owned only; no upstream files are modified.
 
 - **just vs. make vs. bare scripts.** `just` chosen: recipes take pass-through arguments cleanly (FR2), the tool self-lists (FR1), and there is no build-system semantics to fight (no phony targets, no dependency graph beyond simple recipe chaining like `check: lint test`).
 - **Wrappers plus inline shortcuts.** Originally recipes were restricted to thin wrappers over `scripts/`. Relaxed: forcing a linear two-command workflow (like a subtree sync) into a script adds indirection without value, and the recipe body doubles as executable documentation of the workflow. The boundary is logic, not length — the moment a task needs branching, parsing, or error handling, it moves to `scripts/`.
+- **`setup --prod` via a recipe flag, not a wrapper script.** The `--prod` build trigger is a single role-aware step, implemented with `just`'s `[arg("prod", value="true")]` attribute on the `setup` recipe and a one-line `if`/`else` conditional in the recipe body. The alternative — a wrapper script under `scripts/` that parses `--prod` and runs the same bootstrap+build — was rejected: the logic is one linear conditional over an already-parsed value (no arg parsing of our own, no error handling), so a script would add indirection without adding a separately-runnable capability worth keeping. The `just` attribute keeps the recipe the single source of the workflow while staying within NFR1's "linear command sequence" allowance (the conditional is the exception the inline-shortcut relaxation already grants). If the build step ever grows real logic (version checks, artifact validation, multiple targets), it moves to `scripts/` per NFR1.
 
 ## Assumptions (re-check these first when tasks misbehave)
 
-- `just` is installed on contributor machines and in CI.
+- `just` is installed on contributor machines and in CI. The `setup` recipe uses the `[arg(...)]` attribute (`just` 1.27+, 2024) for the `--prod` flag; re-check the pinned/minimum `just` version if a contributor's `just` rejects the attribute.
 - The wrapped scripts keep their command-line interfaces stable, or recipes are updated in the same change (the PRD reference check catches path drift; interface drift is caught by running `check`).
 
 ## Upstream divergence
@@ -45,4 +47,4 @@ None. The justfile is workspace-owned and wraps only workspace scripts.
 
 ## Conflict resolution notes
 
-The stable interface is the task names — `dev`, `lint`, `test`, `check` — and their pass-through behavior, not the justfile text. If the runner or the file format changes, keep those names working and update AGENTS.md and README.md in the same change.
+The stable interface is the task names — `dev`, `setup`, `lint`, `test`, `check` — and their pass-through/flag behavior (`dev` passes trailing flags to the launcher; `setup` accepts `--prod`). Not the justfile text. If the runner or the file format changes, keep those names working and update AGENTS.md and README.md in the same change.
