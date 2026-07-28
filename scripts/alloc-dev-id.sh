@@ -1,20 +1,22 @@
 #!/usr/bin/env bash
 #
-# alloc-dev-id.sh — allocate a per-checkout `.dev-id` for the dev stack.
+# alloc-dev-id.sh — allocate a per-checkout `.dev-id` for the local stack.
 #
 # PRD: docs/prd/5_devid-worktree-allocation.md
 #
 # Idempotent: if `.dev-id` already exists at the repo root, do nothing.
-# Otherwise allocate a unique positive integer so concurrent dev checkouts
+# Otherwise allocate a unique positive integer so concurrent checkouts
 # (including git worktrees) get distinct app-name tags and port blocks
-# (consumed by ecosystem.config.js; see docs/prd/1_local-dev-launcher.md FR3).
+# (consumed by scripts/launch-stack.js → ecosystem.config.js; see
+# docs/prd/1_local-dev-launcher.md FR3/FR5).
 #
 # Allocation rules (see the PRD's functional requirements for the rationale):
-#   - Prod checkout (repo under /opt): .dev-id is not needed (the ecosystem
-#     fixes id 0 for prod). Skip without writing.
-#   - Main worktree of a non-prod checkout: id 1 (deterministic, stable ports).
+#   - Main worktree: id 1 (deterministic, stable ports).
 #   - Linked git worktree: id = max(.dev-id across all worktrees) + 1, starting
 #     the search at 1 so linked worktrees always allocate at >= 2.
+#   - No /opt skip: every checkout — production included — carries a `.dev-id`,
+#     because the launcher embeds the id in the tag and port block regardless of
+#     mode (PRD 1 FR3: production is no longer exempt; PRD 5 FR2).
 #
 # Properties: ids are handed out in setup order; the main clone is
 # deterministic; gaps left by deleted worktrees are harmless because allocation
@@ -28,13 +30,7 @@ set -euo pipefail
 
 root="$(git rev-parse --show-toplevel)"
 
-# Prod checkouts do not carry a .dev-id (role is prod, id 0). See FR2/FR3 of
-# PRD 1 (role from path; .dev-id only for non-prod).
-case "$root" in
-  /opt/*) exit 0 ;;
-esac
-
-# Already allocated — nothing to do. The ecosystem validates the contents;
+# Already allocated — nothing to do. The launcher validates the contents;
 # this script only ensures a value exists.
 [ -f "$root/.dev-id" ] && exit 0
 
@@ -61,4 +57,4 @@ else
 fi
 
 printf '%s\n' "$id" > "$root/.dev-id"
-echo "dev-id $id -> backend :$((18000 + id * 10)), frontend :$((3000 + id * 10)), ingress :$((9000 + id * 10))"
+echo "dev-id $id allocated (the launcher derives ports and tag from it; see docs/prd/1_local-dev-launcher.md)"

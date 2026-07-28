@@ -7,7 +7,7 @@
  * reuses the upstream routing and proxy internals (proxy-utils.mjs, consumed
  * unmodified) and adds only a --host option so the stack port can stay
  * loopback-only by default. It is launched as one PM2 app by
- * ecosystem.config.js (driven by `just dev`).
+ * ecosystem.config.js (driven by `just serve`, which runs scripts/launch-stack.js).
  *
  * If upstream's ingress ever grows a bind-address option, retire this file
  * and call it directly.
