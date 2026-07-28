@@ -40,9 +40,9 @@
  * Usage:
  *   node scripts/launch-stack.js [--fe_port N] [--be_port N] \
  *     [--ingress_port N] [--fe_bind A] [--be_bind A] [--ingress_bind A] \
- *     [--background] [--production] [--dry-run] [--kill]
+ *     [--background] [--production] [--dry-run] [--stop]
  *
- * --kill: stop and delete all background stack processes for this checkout.
+ * --stop: stop and delete all background stack processes for this checkout.
  *   Reads .dev-id and deletes both dev-<id> and prod-<id> namespaces from
  *   the shared PM2 daemon. Idempotent; works across branch switches because
  *   .dev-id is stable. Ignores all other flags except the implied .dev-id.
@@ -92,7 +92,7 @@ function parseCli(argv) {
       background: { type: "boolean", default: false },
       production: { type: "boolean", default: false },
       "dry-run": { type: "boolean", default: false },
-      kill: { type: "boolean", default: false },
+      stop: { type: "boolean", default: false },
     },
     allowPositionals: true,
     strict: true,
@@ -313,7 +313,7 @@ function spawnPm2(r) {
   });
   child.on("exit", (code, signal) => {
     if (signal) {
-      console.error(`[run-stack] ${runner} killed by ${signal}`);
+      console.error(`[run-stack] ${runner} stopped by ${signal}`);
       process.exit(1);
     }
     process.exit(code ?? 1);
@@ -323,7 +323,7 @@ function spawnPm2(r) {
 // ── Entry ────────────────────────────────────────────────────────────────────
 
 /**
- * Kill all background stack processes for the current checkout's .dev-id.
+ * Stop and delete all background stack processes for the current checkout's .dev-id.
  *
  * Reads .dev-id and deletes both `dev-<id>` and `prod-<id>` namespaces from
  * the shared PM2 daemon.  Idempotent: exits 0 if nothing was running.
@@ -332,9 +332,9 @@ function spawnPm2(r) {
  * Even if the tag changed (e.g. someone flipped --production), every possible
  * namespace for this checkout is cleaned.
  */
-function killBackgroundStack(id) {
+function stopBackgroundStack(id) {
   const namespaces = [`dev-${id}`, `prod-${id}`];
-  let anyKilled = false;
+  let anyStoped = false;
 
   return namespaces.reduce((promiseChain, ns) => {
     return promiseChain.then(() => {
@@ -346,7 +346,7 @@ function killBackgroundStack(id) {
         child.stderr.on("data", (d) => { stderr += d; });
         child.on("error", (err) => {
           if (err.code === "ENOENT") {
-            console.error("[kill] pm2 is not installed. Cannot kill background processes.");
+            console.error("[stop] pm2 is not installed. Cannot stop background processes.");
             return reject(new Error("pm2 not found"));
           }
           return reject(err);
@@ -354,26 +354,26 @@ function killBackgroundStack(id) {
         child.on("exit", (code) => {
           const out = (stdout + stderr).trim();
           if (code === 0 && out.includes("delete")) {
-            console.log(`[kill] removed namespace: ${ns}`);
-            anyKilled = true;
+            console.log(`[stop] namespace removed: ${ns}`);
+            anyStoped = true;
           } else if (out.includes("not found") || out.includes("No process")) {
             // Normal: namespace exists but nothing in it, or namespace absent
-            console.log(`[kill] nothing to kill in namespace: ${ns}`);
+            console.log(`[stop] nothing stopped in namespace: ${ns}`);
           } else if (code === 0) {
-            console.log(`[kill] nothing to kill in namespace: ${ns}`);
+            console.log(`[stop] nothing stopped in namespace: ${ns}`);
           } else {
             // pm2 could be down, etc. — not fatal
-            console.log(`[kill] ${ns}: ${out || "pm2 may not be running"}`);
+            console.log(`[stop] ${ns}: ${out || "pm2 may not be running"}`);
           }
           resolve();
         });
       });
     });
   }, Promise.resolve()).then(() => {
-    if (anyKilled) {
-      console.log("[kill] done — background processes for id " + id + " removed.");
+    if (anyStoped) {
+      console.log("[stop] done — background processes for id " + id + " removed.");
     } else {
-      console.log(`[kill] no background processes found for id ${id}.`);
+      console.log(`[stop] no background processes to stop for id ${id}.`);
     }
   });
 }
@@ -387,21 +387,21 @@ function main() {
     console.error(
       `Usage: node scripts/launch-stack.js [--fe_port N] [--be_port N] ` +
         `[--ingress_port N] [--fe_bind A] [--be_bind A] [--ingress_bind A] ` +
-        `[--background] [--production] [--dry-run] [--kill]`,
+        `[--background] [--production] [--dry-run] [--stop]`,
     );
     process.exit(2);
   }
 
-  // --kill bypasses all port/mode resolution; it only needs .dev-id
-  if (values.kill) {
+  // --stop bypasses all port/mode resolution; it only needs .dev-id
+  if (values.stop) {
     let id;
     try {
       id = readDevId(DEV_ID_FILE);
     } catch (err) {
-      console.error(`[kill] ${err.message}`);
+      console.error(`[stop] ${err.message}`);
       process.exit(1);
     }
-    killBackgroundStack(id).catch(() => { process.exit(1); });
+    stopBackgroundStack(id).catch(() => { process.exit(1); });
     return;
   }
 
