@@ -32,7 +32,7 @@ serve *args:
 # docs/prd/1_local-dev-launcher.md FR8). The flag name matches the launcher's
 # `--production` (and `just serve`'s) so the surface is uniform. Dev-mode
 # checkouts never need `--production`.
-[arg("production", value="true")]
+[arg("production", long, value="true")]
 setup production="false":
     ./scripts/alloc-dev-id.sh
     cd packages/software-agent-sdk && uv sync
