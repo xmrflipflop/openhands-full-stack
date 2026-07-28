@@ -42,10 +42,10 @@
  *     [--ingress_port N] [--fe_bind A] [--be_bind A] [--ingress_bind A] \
  *     [--background] [--production] [--dry-run] [--stop]
  *
- * --stop: stop and delete all background stack processes for this checkout.
- *   Reads .dev-id and deletes both dev-<id> and prod-<id> namespaces from
- *   the shared PM2 daemon. Idempotent; works across branch switches because
- *   .dev-id is stable. Ignores all other flags except the implied .dev-id.
+ * --stop: stop and delete the background stack for this checkout. Respects
+ *   --production: `--stop` alone stops dev-<id>; `--production --stop` stops
+ *   prod-<id>. Reads .dev-id and deletes only the matching namespace from the
+ *   shared PM2 daemon. Idempotent; ignoring all other flags.
  */
 
 "use strict";
@@ -323,54 +323,51 @@ function spawnPm2(r) {
 // ── Entry ────────────────────────────────────────────────────────────────────
 
 /**
- * Stop and delete all background stack processes for the current checkout's .dev-id.
+ * Stop and delete all background stack processes for this checkout.
  *
- * Reads .dev-id and deletes both `dev-<id>` and `prod-<id>` namespaces from
- * the shared PM2 daemon.  Idempotent: exits 0 if nothing was running.
- *
- * This works across branch switches because .dev-id is stable (gitignored).
- * Even if the tag changed (e.g. someone flipped --production), every possible
- * namespace for this checkout is cleaned.
+ * Reads .dev-id and the --production flag to select the matching namespace
+ * (dev-<id> or prod-<id>) and deletes it from the shared PM2 daemon.
+ * Idempotent: exits 0 if nothing was running. Respects --production so the
+ * operator can stop one while leaving the other running.
  */
-function stopBackgroundStack(id) {
-  const namespaces = [`dev-${id}`, `prod-${id}`];
-  let anyStoped = false;
+function stopBackgroundStack(id, production) {
+  const ns = production ? `prod-${id}` : `dev-${id}`;
+  let anyStopped = false;
 
-  return namespaces.reduce((promiseChain, ns) => {
-    return promiseChain.then(() => {
-      return new Promise((resolve, reject) => {
-        const child = spawn("pm2", ["delete", ns], { stdio: ["inherit", "pipe", "pipe"] });
-        let stdout = "";
-        let stderr = "";
-        child.stdout.on("data", (d) => { stdout += d; });
-        child.stderr.on("data", (d) => { stderr += d; });
-        child.on("error", (err) => {
-          if (err.code === "ENOENT") {
-            console.error("[stop] pm2 is not installed. Cannot stop background processes.");
-            return reject(new Error("pm2 not found"));
-          }
-          return reject(err);
-        });
-        child.on("exit", (code) => {
-          const out = (stdout + stderr).trim();
-          if (code === 0 && out.includes("delete")) {
-            console.log(`[stop] namespace removed: ${ns}`);
-            anyStoped = true;
-          } else if (out.includes("not found") || out.includes("No process")) {
-            // Normal: namespace exists but nothing in it, or namespace absent
-            console.log(`[stop] nothing stopped in namespace: ${ns}`);
-          } else if (code === 0) {
-            console.log(`[stop] nothing stopped in namespace: ${ns}`);
-          } else {
-            // pm2 could be down, etc. — not fatal
-            console.log(`[stop] ${ns}: ${out || "pm2 may not be running"}`);
-          }
-          resolve();
-        });
+  const promiseChain = Promise.resolve();
+  return promiseChain.then(() => {
+    return new Promise((resolve, reject) => {
+      const child = spawn("pm2", ["delete", ns], { stdio: ["inherit", "pipe", "pipe"] });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (d) => { stdout += d; });
+      child.stderr.on("data", (d) => { stderr += d; });
+      child.on("error", (err) => {
+        if (err.code === "ENOENT") {
+          console.error("[stop] pm2 is not installed. Cannot stop background processes.");
+          return reject(new Error("pm2 not found"));
+        }
+        return reject(err);
+      });
+      child.on("exit", (code) => {
+        const out = (stdout + stderr).trim();
+        if (code === 0 && out.includes("delete")) {
+          console.log(`[stop] namespace removed: ${ns}`);
+          anyStopped = true;
+        } else if (out.includes("not found") || out.includes("No process")) {
+          // Normal: namespace exists but empty, or namespace absent
+          console.log(`[stop] nothing stopped in namespace: ${ns}`);
+        } else if (code === 0) {
+          console.log(`[stop] nothing stopped in namespace: ${ns}`);
+        } else {
+          // pm2 could be down, etc. — not fatal
+          console.log(`[stop] ${ns}: ${out || "pm2 may not be running"}`);
+        }
+        resolve();
       });
     });
-  }, Promise.resolve()).then(() => {
-    if (anyStoped) {
+  }).then(() => {
+    if (anyStopped) {
       console.log("[stop] done — background processes for id " + id + " removed.");
     } else {
       console.log(`[stop] no background processes to stop for id ${id}.`);
@@ -392,7 +389,7 @@ function main() {
     process.exit(2);
   }
 
-  // --stop bypasses all port/mode resolution; it only needs .dev-id
+  // --stop bypasses all port/mode resolution; it only needs .dev-id + mode
   if (values.stop) {
     let id;
     try {
@@ -401,7 +398,7 @@ function main() {
       console.error(`[stop] ${err.message}`);
       process.exit(1);
     }
-    stopBackgroundStack(id).catch(() => { process.exit(1); });
+    stopBackgroundStack(id, values.production).catch(() => { process.exit(1); });
     return;
   }
 
