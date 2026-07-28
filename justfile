@@ -25,7 +25,7 @@ dev *args:
 # (NODE_ENV=production is incompatible with `react-router dev`, so prod does
 # NOT run the Vite dev server — see ecosystem.config.js and
 # docs/prd/1_local-dev-launcher.md FR8). Dev checkouts never need `--prod`.
-[arg("prod", value="true")]
+[arg("prod", long, value="true")]
 setup prod="false":
     ./scripts/alloc-dev-id.sh
     cd packages/software-agent-sdk && uv sync
