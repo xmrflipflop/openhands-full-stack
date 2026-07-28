@@ -19,3 +19,9 @@
 # upstream .gitignore; this is a belt-and-braces workspace guard).
 /node_modules/
 /**/node_modules/
+
+# Production frontend bundle produced by `just setup --prod`, served by the
+# prod static-server app in ecosystem.config.js. The upstream package's own
+# .gitignore already excludes build/; this is a belt-and-braces workspace guard
+# so the prod build artifact is never committed. (docs/prd/1_local-dev-launcher.md)
+/packages/agent-canvas/build/

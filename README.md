@@ -51,11 +51,12 @@ The stack runs strictly from this repository's sources (no upstream releases are
 
 - A checkout under `/opt` is **prod** (base ports); anywhere else is **dev**.
 - Each dev checkout needs a `.dev-id` file (gitignored) holding a unique positive integer, e.g. `echo 1 > .dev-id`. That id derives the port block, app-name tag (`dev1`, `dev2`, …), and PM2 namespace, so concurrent checkouts never clash. (Prod uses id `0` and needs no `.dev-id`.)
+- The frontend is served differently per role: **dev** runs the Vite dev server (`react-router dev`); **prod** serves a prebuilt production bundle through the upstream static file server. The split exists because the Vite dev server cannot run under `NODE_ENV=production` (Vite's SSR JSX transform then imports a runtime that has no `jsxDEV` export, crashing the dev server). Prod requires the bundle to be built first via `just setup --prod`; the prod launcher fails fast with a clear message if it is missing.
 
 | Service | Prod | dev1 | dev2 | Purpose |
 | --- | --- | --- | --- | --- |
 | Stack (ingress) | `:9000` | `:9010` | `:9020` | Single-origin entry point — browse here |
-| Frontend (Vite) | `:3000` | `:3010` | `:3020` | Direct dev-server port, for debugging |
+| Frontend | `:3000` (static server + built SPA) | `:3010` (Vite dev server) | `:3020` (Vite dev server) | Direct frontend port, for debugging |
 | Backend (agent-server) | `:18000` | `:18010` | `:18020` | Direct API port, for debugging (`/docs`) |
 
 ### Dev (foreground)
@@ -71,14 +72,16 @@ The OpenHands Automation backend is not part of this repository and is not start
 
 ### Production (detached)
 
-For a production deployment, clone the repository under `/opt` (the path is the prod signal) and run against the **global** PM2 daemon so the stack survives the operator disconnecting and restarts across machine reboots:
+For a production deployment, clone the repository under `/opt` (the path is the prod signal) and run against the **global** PM2 daemon so the stack survives the operator disconnecting and restarts across machine reboots. Prod serves a **prebuilt** frontend bundle, so the one-time setup also builds it:
 
 ```bash
 git clone <repo-url> /opt/openhands
 cd /opt/openhands
-just setup                       # uv sync + npm install
-pm2 start ecosystem.config.js    # detached, on the global daemon (~/.pm2)
+just setup --prod                  # uv sync + npm install, then build the agent-canvas production bundle (one-time)
+pm2 start ecosystem.config.js      # detached, on the global daemon (~/.pm2)
 ```
+
+`just setup --prod` writes the bundle to `packages/agent-canvas/build/` (gitignored, never committed). If you change the frontend source, rebuild with `just setup --prod` (or `cd packages/agent-canvas && npm run build`) before restarting the stack; starting prod without a build fails fast with a message pointing here. (Dev checkouts never need the build — plain `just setup` skips it.)
 
 Then manage it with PM2's own verbs:
 
@@ -97,6 +100,8 @@ Run `pm2 save` whenever the set of running instances changes, so `pm2 resurrect`
 Run `just` with no arguments to list all recipes. The common ones:
 
 ```bash
+just setup           # bootstrap deps (alloc .dev-id, uv sync, npm install) — once per checkout
+just setup --prod    # same, plus build the agent-canvas production bundle (needed for prod role only)
 just dev             # start the local stack in the foreground (frontend + backend + ingress)
 just lint            # workspace linters, incl. the PRD reference check
 just test            # workspace tests
@@ -105,7 +110,7 @@ just setup-remotes   # set up the upstream git remotes
 just sync            # pull both upstream subtrees
 ```
 
-`just dev` runs `pm2-runtime` in the foreground against a throwaway `PM2_HOME`, so the dev run never touches the global `~/.pm2` daemon. Role (prod under `/opt`, dev elsewhere) derives `NODE_ENV` and the port block, and a unique PM2 namespace per checkout keeps concurrent checkouts from colliding.
+`just dev` runs `pm2-runtime` in the foreground against a throwaway `PM2_HOME`, so the dev run never touches the global `~/.pm2` daemon. Role (prod under `/opt`, dev elsewhere) derives `NODE_ENV` and the port block, and a unique PM2 namespace per checkout keeps concurrent checkouts from colliding. The dev role runs the Vite dev server; the prod role serves a prebuilt bundle (`just setup --prod` builds it), because the Vite dev server cannot run under `NODE_ENV=production`.
 
 ## Develop
 

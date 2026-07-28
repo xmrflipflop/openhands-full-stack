@@ -19,13 +19,23 @@ dev *args:
 # Allocates the per-checkout `.dev-id` first so the dev stack can derive a
 # unique app-name tag and port block (idempotent; supports git worktrees).
 # See docs/prd/5_devid-worktree-allocation.md.
-setup:
+#
+# Pass `--prod` to additionally build the Agent Canvas production bundle into
+# packages/agent-canvas/build/. The prod launcher serves this prebuilt SPA
+# (NODE_ENV=production is incompatible with `react-router dev`, so prod does
+# NOT run the Vite dev server — see ecosystem.config.js and
+# docs/prd/1_local-dev-launcher.md FR8). Dev checkouts never need `--prod`.
+[arg("prod", value="true")]
+setup prod="false":
     ./scripts/alloc-dev-id.sh
     cd packages/software-agent-sdk && uv sync
     cd packages/agent-canvas && npm install
-
-# build:
-#   echo Building…
+    if [ "{{prod}}" = "true" ]; then \
+        echo "→ --prod: building agent-canvas production bundle (npm run build:app)"; \
+        npm run build --prefix packages/agent-canvas; \
+    else \
+        echo "→ skipping production frontend build (dev checkout; pass --prod to build it)"; \
+    fi
 
 # Run lint and test
 check: lint test
