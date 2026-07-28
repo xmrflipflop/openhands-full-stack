@@ -40,7 +40,12 @@
  * Usage:
  *   node scripts/launch-stack.js [--fe_port N] [--be_port N] \
  *     [--ingress_port N] [--fe_bind A] [--be_bind A] [--ingress_bind A] \
- *     [--background] [--production] [--dry-run]
+ *     [--background] [--production] [--dry-run] [--kill]
+ *
+ * --kill: stop and delete all background stack processes for this checkout.
+ *   Reads .dev-id and deletes both dev-<id> and prod-<id> namespaces from
+ *   the shared PM2 daemon. Idempotent; works across branch switches because
+ *   .dev-id is stable. Ignores all other flags except the implied .dev-id.
  */
 
 "use strict";
@@ -87,6 +92,7 @@ function parseCli(argv) {
       background: { type: "boolean", default: false },
       production: { type: "boolean", default: false },
       "dry-run": { type: "boolean", default: false },
+      kill: { type: "boolean", default: false },
     },
     allowPositionals: true,
     strict: true,
@@ -100,7 +106,7 @@ function readDevId(devIdFile) {
       `No .dev-id file at ${devIdFile}. Every checkout — including ` +
         `production — now requires a .dev-id with a unique positive ` +
         `integer. Run 'just setup' (which allocates one), or create it ` +
-        `manually, e.g.: echo 1 > ${devIdFile} (PRD FR3).`,
+        `manually, e.g.: echo 1 > ${devIdFile}.`,
     );
   }
   const raw = String(fs.readFileSync(devIdFile, "utf8")).trim();
@@ -109,7 +115,7 @@ function readDevId(devIdFile) {
     throw new Error(
       `.dev-id must be a positive integer (got ${JSON.stringify(raw)} at ` +
         `${devIdFile}). The launcher validates .dev-id; it never allocates ` +
-        `one (PRD FR3).`,
+        `one.`,
     );
   }
   return id;
@@ -163,7 +169,7 @@ function validatePort(service, value, source) {
   if (!Number.isInteger(n) || n < PORT_MIN || n > PORT_MAX) {
     throw new Error(
       `Invalid ${service} port from ${source}: ${JSON.stringify(value)}. ` +
-        `Must be an integer in ${PORT_MIN}-${PORT_MAX} (PRD FR2).`,
+        `Must be an integer in ${PORT_MIN}-${PORT_MAX}.`,
     );
   }
   return n;
@@ -198,7 +204,7 @@ function productionPreflight(isProduction) {
       `Production requires a built frontend SPA at ` +
         `${path.dirname(CANVAS_BUILD_INDEX)} (missing ${CANVAS_BUILD_INDEX}). ` +
         `Run 'just setup --production' (or 'cd packages/agent-canvas && npm run build') ` +
-        `before starting the production stack (PRD FR8c).`,
+        `before starting the production stack.`,
     );
   }
 }
@@ -316,6 +322,62 @@ function spawnPm2(r) {
 
 // ── Entry ────────────────────────────────────────────────────────────────────
 
+/**
+ * Kill all background stack processes for the current checkout's .dev-id.
+ *
+ * Reads .dev-id and deletes both `dev-<id>` and `prod-<id>` namespaces from
+ * the shared PM2 daemon.  Idempotent: exits 0 if nothing was running.
+ *
+ * This works across branch switches because .dev-id is stable (gitignored).
+ * Even if the tag changed (e.g. someone flipped --production), every possible
+ * namespace for this checkout is cleaned.
+ */
+function killBackgroundStack(id) {
+  const namespaces = [`dev-${id}`, `prod-${id}`];
+  let anyKilled = false;
+
+  return namespaces.reduce((promiseChain, ns) => {
+    return promiseChain.then(() => {
+      return new Promise((resolve, reject) => {
+        const child = spawn("pm2", ["delete", ns], { stdio: ["inherit", "pipe", "pipe"] });
+        let stdout = "";
+        let stderr = "";
+        child.stdout.on("data", (d) => { stdout += d; });
+        child.stderr.on("data", (d) => { stderr += d; });
+        child.on("error", (err) => {
+          if (err.code === "ENOENT") {
+            console.error("[kill] pm2 is not installed. Cannot kill background processes.");
+            return reject(new Error("pm2 not found"));
+          }
+          return reject(err);
+        });
+        child.on("exit", (code) => {
+          const out = (stdout + stderr).trim();
+          if (code === 0 && out.includes("delete")) {
+            console.log(`[kill] removed namespace: ${ns}`);
+            anyKilled = true;
+          } else if (out.includes("not found") || out.includes("No process")) {
+            // Normal: namespace exists but nothing in it, or namespace absent
+            console.log(`[kill] nothing to kill in namespace: ${ns}`);
+          } else if (code === 0) {
+            console.log(`[kill] nothing to kill in namespace: ${ns}`);
+          } else {
+            // pm2 could be down, etc. — not fatal
+            console.log(`[kill] ${ns}: ${out || "pm2 may not be running"}`);
+          }
+          resolve();
+        });
+      });
+    });
+  }, Promise.resolve()).then(() => {
+    if (anyKilled) {
+      console.log("[kill] done — background processes for id " + id + " removed.");
+    } else {
+      console.log(`[kill] no background processes found for id ${id}.`);
+    }
+  });
+}
+
 function main() {
   let values;
   try {
@@ -325,9 +387,22 @@ function main() {
     console.error(
       `Usage: node scripts/launch-stack.js [--fe_port N] [--be_port N] ` +
         `[--ingress_port N] [--fe_bind A] [--be_bind A] [--ingress_bind A] ` +
-        `[--background] [--production] [--dry-run]`,
+        `[--background] [--production] [--dry-run] [--kill]`,
     );
     process.exit(2);
+  }
+
+  // --kill bypasses all port/mode resolution; it only needs .dev-id
+  if (values.kill) {
+    let id;
+    try {
+      id = readDevId(DEV_ID_FILE);
+    } catch (err) {
+      console.error(`[kill] ${err.message}`);
+      process.exit(1);
+    }
+    killBackgroundStack(id).catch(() => { process.exit(1); });
+    return;
   }
 
   let r;

@@ -19,6 +19,14 @@ help:
 serve *args:
     node scripts/launch-stack.js {{args}}
 
+# Kill all background stack processes for this checkout.
+# Reads .dev-id and deletes both dev-<id> and prod-<id> PM2 namespaces from
+# the shared daemon. Idempotent (exits 0 if nothing was running). Works
+# across branch switches because .dev-id is stable (gitignored).
+# Pass --kill directly to the launcher; all other flags are ignored by --kill.
+kill *args:
+    node scripts/launch-stack.js --kill {{args}}
+
 # Bootstrap dependencies the stack expects (run once per checkout).
 # Allocates the per-checkout `.dev-id` first so the launcher can derive a unique
 # app-name tag (dev-<id>/prod-<id>) and port block (idempotent; supports git

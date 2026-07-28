@@ -115,6 +115,7 @@ File references rot when files move; requirements do not. Handle the mismatch wi
 - **PRD numbers and slugs are stable identifiers.** Never rename a PRD file: mark it superseded (naming the successor) and create the new one under the next unused number. Everything may point at a PRD filename forever.
 - **Paths appear in exactly one place per PRD.** Repository paths belong only in the Scope table; everywhere else refer to components by role ("the launcher", "the ingress runner"). A file move then touches one table row, and prose never rots.
 - **Drift is checked mechanically, not by discipline.** `scripts/check-prd-refs.sh` validates both directions: every path an active PRD references exists, every PRD referenced from code exists, and every marker names its PRD. Run it in the Validation step and in CI so a rename fails immediately, while the author still has the context to fix it.
+- **PRDs are development artifacts, not runtime content.** PRD filenames, requirement numbers (FR1, FR8c, NFR6, etc.), and the phrase "PRD" must never appear in user-facing output: error messages, console output, log lines, CLI help text, or any string that a developer running the stack would see. PRD references belong in code comments and `docs/prd/` files only. If an error message needs to explain *why* something must happen, rephrase it as the reason itself — never as a requirement number.
 
 ## Package development
 

@@ -105,7 +105,7 @@ function requireStackVar(name) {
     throw new Error(
       `${name} is not set. The ecosystem derives nothing — every value is ` +
         `provided by the launcher (${LAUNCHER_NAME}). Start the stack with ` +
-        `'just serve', not a bare 'pm2 start ecosystem.config.js' (PRD FR15).`,
+        `'just serve', not a bare 'pm2 start ecosystem.config.js'.`,
     );
   }
   return v;
@@ -156,7 +156,7 @@ if (isProductionNodeEnv && !fs.existsSync(path.join(CANVAS_BUILD_DIR, "index.htm
     `Production requires a built frontend SPA at ${CANVAS_BUILD_DIR} ` +
       `(missing index.html). Run 'just setup --production' (or ` +
       `'cd packages/agent-canvas && npm run build') before starting the ` +
-      `production stack (PRD FR8c / FR13b).`,
+      `production stack.`,
   );
 }
 
