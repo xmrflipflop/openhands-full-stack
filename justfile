@@ -40,6 +40,12 @@ kill *args:
 # docs/prd/1_local-dev-launcher.md FR8). The flag name matches the launcher's
 # `--production` (and `just serve`'s) so the surface is uniform. Dev-mode
 # checkouts never need `--production`.
+#
+# In dev mode (no `--production`) this ALSO runs `just setup-remotes` so a fresh
+# checkout is ready for `just sync` against the upstream subtrees. That step only
+# records remote URLs (no network), is idempotent, and is intentionally skipped
+# in production (a deployment does not need the upstream sync remotes). See
+# docs/prd/3_just-task-runner.md FR2b.
 [arg("production", long, value="true")]
 setup production="false":
     ./scripts/alloc-dev-id.sh
@@ -49,6 +55,8 @@ setup production="false":
         echo "→ --production: building agent-canvas production bundle (npm run build)"; \
         npm run build --prefix packages/agent-canvas; \
     else \
+        echo "→ dev mode: ensuring upstream git remotes (just setup-remotes, idempotent, no network)"; \
+        just setup-remotes; \
         echo "→ skipping production frontend build (dev mode; pass --production to build it)"; \
     fi
 
