@@ -67,7 +67,7 @@ Key points:
 ### Foreground (default)
 
 ```bash
-just setup            # uv sync + npm install (allocates .dev-id, once per checkout)
+just setup            # alloc .dev-id + uv sync + npm install; in dev mode also configures upstream git remotes (once per checkout)
 just serve            # foreground: backend + frontend + ingress, logs stream, Ctrl-C stops all
 ```
 
@@ -114,14 +114,14 @@ Snapshot/restore (`pm2 save` / `pm2 resurrect`) is intentionally **not** support
 Run `just` with no arguments to list all recipes. The common ones:
 
 ```bash
-just setup           # bootstrap deps (alloc .dev-id, uv sync, npm install) — once per checkout
-just setup --production    # same, plus build the agent-canvas production bundle (needed for production mode only)
+just setup           # bootstrap deps (alloc .dev-id, uv sync, npm install) — also runs just setup-remotes in dev mode — once per checkout
+just setup --production    # same, but builds the agent-canvas production bundle (and skips the git-remote step — not needed to serve) — production mode only
 just serve           # start the local stack in the foreground (frontend + backend + ingress)
 just serve --background   # detach: leave the stack running on the shared daemon
 just lint            # workspace linters, incl. the PRD reference check
 just test            # workspace tests
 just check           # lint + test — run before pushing
-just setup-remotes   # set up the upstream git remotes
+just setup-remotes   # set up the upstream git remotes (also run automatically by just setup in dev mode)
 just sync            # pull both upstream subtrees
 ```
 
