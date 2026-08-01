@@ -72,22 +72,30 @@ lint *args:
   @echo Linting PRD references
   ./scripts/check-prd-refs.sh
 
-# Set up the canonical upstream git remotes
+# Set up the canonical upstream git remotes.
+# Note: the `agent-canvas` remote points at the OpenHands monorepo
+# (https://github.com/OpenHands/OpenHands), whose repo root IS the agent-canvas
+# frontend — the standalone OpenHands/agent-canvas repo is the retired source.
+# See docs/prd/7_agent-canvas-source-monomrepo.md for the rationale.
 setup-remotes:
-    git remote add agent-canvas https://github.com/OpenHands/agent-canvas.git || git remote set-url agent-canvas https://github.com/OpenHands/agent-canvas.git
+    git remote add agent-canvas https://github.com/OpenHands/OpenHands.git || git remote set-url agent-canvas https://github.com/OpenHands/OpenHands.git
     git remote add software-agent-sdk https://github.com/OpenHands/software-agent-sdk.git || git remote set-url software-agent-sdk https://github.com/OpenHands/software-agent-sdk.git
     git config remote.software-agent-sdk.tagOpt --no-tags
     git config remote.agent-canvas.tagOpt --no-tags
     git remote -v
 
+# `repo` is the GitHub repository slug whose `releases/latest` resolves the
+# default ref. It defaults to `name` (the git remote and prefix). For the
+# agent-canvas subtree the remote/prefix stay `agent-canvas`, but releases are
+# published on the OpenHands monorepo, so the slug is `OpenHands`.
 [private]
-sync-subtree name ref="latest":
+sync-subtree name ref="latest" repo=name:
     #!/usr/bin/env bash
     set -euxo pipefail
 
     ref="{{ref}}"
     if [[ "$ref" == "latest" ]]; then
-        ref=$(curl -fsSL "https://api.github.com/repos/OpenHands/{{name}}/releases/latest" | jq -er '.tag_name')
+        ref=$(curl -fsSL "https://api.github.com/repos/OpenHands/{{repo}}/releases/latest" | jq -er '.tag_name')
     fi
 
     git fetch --no-tags "{{name}}" "refs/tags/$ref"
@@ -97,8 +105,8 @@ sync-subtree name ref="latest":
 # Sync the software-agent-sdk subtree
 sync-sdk ref="latest": (sync-subtree "software-agent-sdk" ref)
 
-# Sync the agent-canvas subtree
-sync-canvas ref="latest": (sync-subtree "agent-canvas" ref)
+# Sync the agent-canvas subtree (sourced from the OpenHands monorepo)
+sync-canvas ref="latest": (sync-subtree "agent-canvas" ref "OpenHands")
 
 # Sync subtree packages from upstream
 sync: sync-canvas sync-sdk

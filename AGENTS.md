@@ -6,8 +6,10 @@ This repository is an integration workspace for two canonical OpenHands projects
 
 | Local path | Canonical upstream | Git remote |
 | --- | --- | --- |
-| `packages/agent-canvas` | `https://github.com/OpenHands/agent-canvas.git` | `agent-canvas` |
+| `packages/agent-canvas` | `https://github.com/OpenHands/OpenHands.git` | `agent-canvas` |
 | `packages/software-agent-sdk` | `https://github.com/OpenHands/software-agent-sdk.git` | `software-agent-sdk` |
+
+> The `agent-canvas` subtree is sourced from the OpenHands monorepo (`OpenHands/OpenHands`), whose repository root *is* the `@openhands/agent-canvas` frontend — the standalone `OpenHands/agent-canvas` repository is the retired previous source. The git remote keeps the name `agent-canvas` (the directory prefix and every consumer depend on it); only its URL and the release-fetch slug redirect to the monorepo. See `docs/prd/7_agent-canvas-source-monomrepo.md`.
 
 - `packages/agent-canvas` contains the self-hostable Agent Canvas application.
 - `packages/software-agent-sdk` contains the shared Software Agent SDK.
@@ -23,7 +25,7 @@ This repository is an integration workspace for two canonical OpenHands projects
 ├── .github/
 │   └── workflows/                 # Workspace CI/CD workflows
 ├── packages/
-│   ├── agent-canvas/              # Git subtree: OpenHands/agent-canvas
+│   ├── agent-canvas/              # Git subtree: OpenHands/OpenHands (frontend root)
 │   └── software-agent-sdk/        # Git subtree: OpenHands/software-agent-sdk
 ├── docker/
 │   ├── Dockerfile                 # Optional combined workspace image
@@ -39,7 +41,7 @@ This repository is an integration workspace for two canonical OpenHands projects
 | Path | Ownership and purpose |
 | --- | --- |
 | `justfile` | Workspace task entry points (`just`): wrappers over `scripts/` and workspace shortcuts |
-| `packages/agent-canvas/` | Imported Git subtree from `OpenHands/agent-canvas` |
+| `packages/agent-canvas/` | Imported Git subtree from `OpenHands/OpenHands` (the monorepo's frontend root) |
 | `packages/software-agent-sdk/` | Imported Git subtree from `OpenHands/software-agent-sdk` |
 | `docker/Dockerfile` | Workspace container image definition |
 | `docker/compose.yaml` | Workspace local-service orchestration |
@@ -209,7 +211,7 @@ Keep the remote names and local prefixes stable.
 
 | Upstream | Remote | Local prefix |
 | --- | --- | --- |
-| `OpenHands/agent-canvas` | `agent-canvas` | `packages/agent-canvas` |
+| `OpenHands/OpenHands` (frontend root) | `agent-canvas` | `packages/agent-canvas` |
 | `OpenHands/software-agent-sdk` | `software-agent-sdk` | `packages/software-agent-sdk` |
 
 Set up or verify remotes (idempotent; prints the configured remotes):
@@ -225,15 +227,15 @@ git ls-remote --symref agent-canvas HEAD
 git ls-remote --symref software-agent-sdk HEAD
 ```
 
-Pull canonical upstream changes with the matching prefix:
+Pull canonical upstream changes with the matching prefix. `just sync` (and each `just sync-<pkg>`) resolves the `latest` ref to the upstream's most recent GitHub release tag and `git subtree merge`s that tag; pass an explicit `<ref>` for a specific release tag:
 
 ```bash
-just sync                 # both subtrees, from upstream main
-just sync-canvas <ref>    # one package or a non-main ref
+just sync                 # both subtrees, at their latest release tag
+just sync-canvas <ref>    # Agent Canvas only, at a specific tag (e.g. v1.8.0)
 just sync-sdk <ref>
 ```
 
-These wrap the standard subtree pulls, which remain the underlying mechanism (run them directly if the recipes are unavailable):
+These wrap the standard subtree pulls, which remain the underlying mechanism (run them directly if the recipes are unavailable). The `agent-canvas` remote points at the OpenHands monorepo, so `git fetch agent-canvas` fetches the monorepo:
 
 ```bash
 git fetch agent-canvas
@@ -265,11 +267,11 @@ chore: update agent-canvas subtree
 
 If changes within a subtree should be submitted upstream, use a personal fork rather than pushing to a canonical OpenHands remote.
 
-Optional fork remotes:
+Optional fork remotes. The `agent-canvas` fork should be a fork of the OpenHands monorepo (`OpenHands/OpenHands`), not the retired standalone repo, since the upstream subtree is sourced from the monorepo's frontend root:
 
 ```bash
 git remote add agent-canvas-fork \
-  https://github.com/xmrflipflop/agent-canvas.git
+  https://github.com/xmrflipflop/OpenHands.git
 
 git remote add software-agent-sdk-fork \
   https://github.com/xmrflipflop/software-agent-sdk.git

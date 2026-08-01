@@ -79,6 +79,7 @@ The launcher sets, the ecosystem reads, and all are hard-error if absent except 
 
 ## Assumptions (re-check these first when upstream changes)
 
+- The `packages/agent-canvas` subtree is sourced from the OpenHands monorepo (OpenHands/OpenHands), whose repository root is the `@openhands/agent-canvas` frontend, not the retired standalone OpenHands/agent-canvas repository. The git remote keeps the name `agent-canvas`; only its URL and the release-fetch slug redirect to the monorepo. The redirection rationale and its own assumptions live in `docs/prd/7_agent-canvas-source-monomrepo.md`. Every "Re-check on upstream sync" note below applies to the monorepo's frontend root after each `just sync`.
 - `pm2` (any current v7+) is installed on contributor machines, in CI, and in any deployment image. The launcher spawns `pm2-runtime` (foreground) and `pm2` (background) by name from `PATH`; both ship with pm2.
 - The SDK remains a single uv workspace whose members include the agent-server; it exposes a runnable agent-server entry point accepting host and port options; and `uv sync` materialises a `.venv` whose `python` can import and run the agent-server entry function.
 - The frontend keeps a `dev:frontend` package script that starts only the dev server (without spawning backends), honours environment configuration for its port and backend host, and proxies API/websocket path prefixes to the configured backend. (Consumed only by the development serving path.)
