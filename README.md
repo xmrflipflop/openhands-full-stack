@@ -64,6 +64,35 @@ Key points:
 | Frontend | `:3010` (Vite dev server) | `:3015` (static server + built SPA) | Direct frontend port, for debugging |
 | Backend (agent-server) | `:18010` | `:18015` | Direct API port, for debugging (`/docs`) |
 
+### Environment variables and secrets
+
+See the [environment variable documentation](https://docs.openhands.dev/openhands/usage/agent-canvas/setup#environment-variables) from OpenHands.
+
+Set `LOCAL_BACKEND_API_KEY` to a secure API key when connecting to the backend from another frontend client. If unset, it is generated automatically and saved to `~/.openhands/agent-canvas/dev-local-api-key`.
+
+`OH_SECRET_KEY` encrypts stored secrets. Set it to a secure, persistent value so secrets remain decryptable across sessions.
+
+```
+openssl rand -hex 32
+```
+
+<details>
+<summary>Implementation note</summary>
+
+**As of 1 August 2026; commit [0246ef174d8997c38f6dff377f4cf61830714d76](https://github.com/xmrflipflop/openhands-full-stack/commit/0246ef174d8997c38f6dff377f4cf61830714d76):** If `OH_SECRET_KEY` is unset, `LOCAL_BACKEND_API_KEY` is used instead. This is portable, but less secure because the same key protects backend access and encrypted secrets.
+
+To decrypt a stored secret:
+
+```python
+from hashlib import sha256
+from base64 import urlsafe_b64encode
+from cryptography.fernet import Fernet
+
+key = urlsafe_b64encode(sha256(OH_SECRET_KEY.encode()).digest())
+Fernet(key).decrypt(token)
+```
+</details>
+
 ### Foreground (default)
 
 ```bash
