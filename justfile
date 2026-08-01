@@ -11,7 +11,7 @@ help:
 # ingress, streamed logs, Ctrl-C stops everything. Forwards all flags unchanged
 # to scripts/launch-stack.js (the only supported entry point), which resolves
 # every deployment value (per-checkout id, tag, ports, binds, session key,
-# NODE_ENV) and hands them to ecosystem.config.js as STACK_* env vars.
+# workspace directory, NODE_ENV) and hands them to ecosystem.config.js as STACK_* env vars.
 # Foreground runs `pm2-runtime` against a THROWAWAY PM2_HOME keyed on the tag,
 # so the run never touches the global ~/.pm2 daemon. Pass --background to detach
 # against the shared daemon instead, and --production to serve the prebuilt SPA.

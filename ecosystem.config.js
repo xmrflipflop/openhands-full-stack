@@ -119,6 +119,9 @@ const backendBind = requireStackVar("STACK_BE_BIND");
 const ingressBind = requireStackVar("STACK_INGRESS_BIND");
 const tag = requireStackVar("STACK_TAG");
 const apiKey = requireStackVar("STACK_SESSION_API_KEY");
+const workspaceDir = requireStackVar("STACK_WORKSPACE_DIR");
+const conversationsDir = requireStackVar("STACK_CONVERSATIONS_DIR");
+const bashEventsDir = requireStackVar("STACK_BASH_EVENTS_DIR");
 const namespace = tag;
 
 // NODE_ENV — the only optional STACK/env value. It drives the frontend serving
@@ -169,6 +172,9 @@ const sharedEnv = {
   PYTHONUTF8: "1",
   DEV_REPO_ROOT: repoRoot,
   NODE_ENV,
+  OH_WORKSPACE_PATH: workspaceDir,
+  OH_CONVERSATIONS_PATH: conversationsDir,
+  OH_BASH_EVENTS_DIR: bashEventsDir,
 };
 
 

@@ -40,7 +40,7 @@
  * Usage:
  *   node scripts/launch-stack.js [--fe_port N] [--be_port N] \
  *     [--ingress_port N] [--fe_bind A] [--be_bind A] [--ingress_bind A] \
- *     [--background] [--production] [--dry-run] [--stop]
+ *     [--workspace_dir PATH] [--background] [--production] [--dry-run] [--stop]
  *
  * --stop: stop and delete the background stack for this checkout. Respects
  *   --production: `--stop` alone stops dev-<id>; `--production --stop` stops
@@ -89,6 +89,7 @@ function parseCli(argv) {
       fe_bind: { type: "string" },
       be_bind: { type: "string" },
       ingress_bind: { type: "string" },
+      workspace_dir: { type: "string" },
       background: { type: "boolean", default: false },
       production: { type: "boolean", default: false },
       "dry-run": { type: "boolean", default: false },
@@ -238,6 +239,29 @@ function resolve(values) {
   productionPreflight(isProduction);
   const sessionApiKey = resolveSessionApiKey();
 
+  // Resolve workspace directory: flag -> env var -> default (repo_root/workspace)
+  const workspaceDirFlag = values.workspace_dir;
+  let workspaceDir;
+  let conversationsDir;
+  let bashEventsDir;
+  if (workspaceDirFlag !== undefined) {
+    // Validate the provided path
+    if (workspaceDirFlag === "") {
+      throw new Error("Workspace directory cannot be empty");
+    }
+    workspaceDir = path.resolve(workspaceDirFlag);
+  } else {
+    const fromEnv = process.env.WORKSPACE_DIR;
+    if (fromEnv && fromEnv.trim()) {
+      workspaceDir = path.resolve(fromEnv.trim());
+    } else {
+      // Default to <repo_root>/workspace
+      workspaceDir = path.join(REPO_ROOT, "workspace");
+    }
+  }
+  conversationsDir = path.join(workspaceDir, 'conversations');
+  bashEventsDir = path.join(workspaceDir, 'bash_events');
+
   // Foreground (default) uses a throwaway PM2_HOME keyed on the tag so the
   // foreground run never touches the shared ~/.pm2 daemon. Background uses
   // the shared daemon and sets no PM2_HOME. (FR13.)
@@ -258,6 +282,9 @@ function resolve(values) {
     background,
     dryRun,
     pm2Home,
+    workspaceDir,
+    conversationsDir,
+    bashEventsDir,
   };
 }
 
@@ -276,6 +303,9 @@ function buildStackEnv(r) {
     STACK_INGRESS_BIND: r.ingressBind,
     STACK_TAG: r.tag,
     STACK_SESSION_API_KEY: r.sessionApiKey,
+    STACK_WORKSPACE_DIR: r.workspaceDir,
+    STACK_CONVERSATIONS_DIR: r.conversationsDir,
+    STACK_BASH_EVENTS_DIR: r.bashEventsDir,
     NODE_ENV: r.nodeEnv,
   };
 }

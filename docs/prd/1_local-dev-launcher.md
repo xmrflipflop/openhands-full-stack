@@ -36,7 +36,12 @@ The ecosystem was previously self-deriving (role from the checkout path, identit
 ## Functional requirements
 
 - **FR1** — `scripts/launch-stack.js` is the only supported entry point. It resolves every deployment-specific value and hands off to PM2. It performs no supervision, holds no state between invocations, and duplicates none of PM2's verbs.
-- **FR2** — The launcher's interface is flags, and nothing more: `--fe_port`, `--be_port`, `--ingress_port`, `--fe_bind`, `--be_bind`, `--ingress_bind` (all six default independently), `--background`, `--production`, `--dry-run`. Ports outside 1024–65535 or non-integer are a hard error.
+- **FR2** — The launcher's interface is flags, and nothing more: `--fe_port`, `--be_port`, `--ingress_port`, `--fe_bind`, `--be_bind`, `--ingress_bind`, `--workspace_dir` (all six default independently), `--background`, `--production`, `--dry-run`. Ports outside 1024–65535 or non-integer are a hard error.
+- **FR19** — The launcher accepts a `--workspace_dir` flag (or `WORKSPACE_DIR` env var) to set the base directory for all agent-server data. It defaults to `<repo_root>/workspace`. From this base, it derives:
+  - `OH_WORKSPACE_PATH` = `<workspace_dir>` (default workspace for conversations)
+  - `OH_CONVERSATIONS_PATH` = `<workspace_dir>/conversations` (conversation storage)
+  - `OH_BASH_EVENTS_DIR` = `<workspace_dir>/bash_events` (bash command history)
+  This enables git worktree isolation where each checkout can have its own independent data directory that can be safely cleaned with `git clean`.
 - **FR3** — Every checkout carries a `.dev-id` containing a positive integer. Production is no longer exempt — the tag embeds the id. A `.dev-id` is required even when all ports are passed. A missing or invalid `.dev-id` aborts the launch. The launcher validates the id; it never allocates one. Allocation is owned by `docs/prd/5_devid-worktree-allocation.md`.
 - **FR4** — The tag is `dev-<id>` or `prod-<id>`, used verbatim as the app-name suffix, the PM2 namespace, and the log subdirectory.
 - **FR5** — Default ports are `base + id×10`, plus 5 for production. Bases are 3000 / 18000 / 9000 for frontend / backend / ingress. Ids start at 1. The production offset moves production off the round numbers so a development and a production of the same id (or same checkout) cannot collide; the step must stay larger than the offset, else different dev/prod ids could collide (a step of 1 would collide `dev-6` with `prod-1`). Each of the six ports defaults independently; a port flag overrides the computed default.
