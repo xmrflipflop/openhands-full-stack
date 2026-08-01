@@ -217,7 +217,8 @@ function productionPreflight(isProduction) {
  *   feBind:string,beBind:string,ingressBind:string,
  *   tag:string,namespace:string,sessionApiKey:string,
  *   nodeEnv:string,isProduction:boolean,background:boolean,dryRun:boolean,
- *   pm2Home:(string|undefined)}}
+ *   pm2Home:(string|undefined),workspaceDir:string,conversationsDir:string,
+ *   bashEventsDir:string,conversationWorkingDir:string}}
  */
 function resolve(values) {
   const isProduction = values.production === true;
@@ -262,6 +263,18 @@ function resolve(values) {
   conversationsDir = path.join(workspaceDir, 'conversations');
   bashEventsDir = path.join(workspaceDir, 'bash_events');
 
+  // The frontend's per-conversation working dir for conversations started
+  // WITHOUT an explicit workspace. The frontend computes it from
+  // VITE_WORKING_DIR (falling back to the relative "workspace/project"
+  // default, which the agent-server resolves against its home dir →
+  // ~/workspace/project/<hex>). Anchoring it under the operator-chosen
+  // workspace_dir keeps those dirs inside the configured workspace and
+  // preserves the "workspace/project/<hex>" sub-structure downstream code
+  // assumes. DEV is honored at serve time (Vite exposes VITE_* process env
+  // to import.meta.env); PROD is a build-time value, so this is a no-op for
+  // the served bundle unless the build is rebuilt with the env set.
+  const conversationWorkingDir = path.join(workspaceDir, 'project');
+
   // Foreground (default) uses a throwaway PM2_HOME keyed on the tag so the
   // foreground run never touches the shared ~/.pm2 daemon. Background uses
   // the shared daemon and sets no PM2_HOME. (FR13.)
@@ -285,6 +298,7 @@ function resolve(values) {
     workspaceDir,
     conversationsDir,
     bashEventsDir,
+    conversationWorkingDir,
   };
 }
 
@@ -306,6 +320,7 @@ function buildStackEnv(r) {
     STACK_WORKSPACE_DIR: r.workspaceDir,
     STACK_CONVERSATIONS_DIR: r.conversationsDir,
     STACK_BASH_EVENTS_DIR: r.bashEventsDir,
+    STACK_VITE_WORKING_DIR: r.conversationWorkingDir,
     NODE_ENV: r.nodeEnv,
   };
 }

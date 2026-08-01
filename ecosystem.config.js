@@ -122,6 +122,22 @@ const apiKey = requireStackVar("STACK_SESSION_API_KEY");
 const workspaceDir = requireStackVar("STACK_WORKSPACE_DIR");
 const conversationsDir = requireStackVar("STACK_CONVERSATIONS_DIR");
 const bashEventsDir = requireStackVar("STACK_BASH_EVENTS_DIR");
+// Base dir the frontend uses for per-conversation working_dirs when the user
+// starts a conversation WITHOUT picking an explicit workspace. The frontend
+// reads it as `import.meta.env.VITE_WORKING_DIR` (agent-server-config.ts
+// `getAgentServerWorkingDir()`); when unset it falls back to the relative
+// "workspace/project" default, which the agent-server resolves against its
+// home dir → ~/workspace/project/<id_hex>. Anchoring it under the
+// operator-chosen workspace_dir keeps those dirs inside the configured tree.
+//
+// Dev honors this at serve time (Vite exposes VITE_* process env to
+// import.meta.env), so it is set on the dev frontend app env below. Prod does
+// NOT: VITE_WORKING_DIR in a production build is baked at `vite build` time,
+// not read at serve time, and the production static server has no runtime
+// injection seam for it (it only injects the session key). To make the
+// served bundle honor a per-deployment workspace_dir it must be rebuilt with
+// VITE_WORKING_DIR set (e.g. `just setup --production` with the env exported).
+const viteWorkingDir = requireStackVar("STACK_VITE_WORKING_DIR");
 const namespace = tag;
 
 // NODE_ENV — the only optional STACK/env value. It drives the frontend serving
@@ -248,6 +264,11 @@ const frontendApp = isProductionNodeEnv
         VITE_SESSION_API_KEY: apiKey,
         VITE_FRONTEND_PORT: String(FRONTEND_PORT),
         VITE_BACKEND_HOST: backendHost,
+        // Per-conversation working_dir base for conversations started without
+        // an explicit workspace (FR20). Read by the frontend as
+        // import.meta.env.VITE_WORKING_DIR. Dev only — see the viteWorkingDir
+        // note above for the prod build-time caveat.
+        VITE_WORKING_DIR: viteWorkingDir,
       },
       ...supervise,
       ...logFields("frontend"),
