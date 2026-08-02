@@ -71,7 +71,7 @@ const DEV_ID_FILE = path.join(REPO_ROOT, ".dev-id");
 const CANVAS_BUILD_INDEX = path.join(
   REPO_ROOT,
   "packages",
-  "agent-canvas",
+  "OpenHands",
   "build",
   "index.html",
 );
@@ -126,7 +126,7 @@ function readDevId(devIdFile) {
  * (MOVED here unchanged — FR8b). Precedence:
  *   (1) LOCAL_BACKEND_API_KEY env var;
  *   (2) the persisted key at OH_SESSION_API_KEY_PATH (default
- *       ~/.openhands/agent-canvas/dev-local-api-key); if missing/empty,
+ *       ~/.openhands/OpenHands/dev-local-api-key); if missing/empty,
  *   (3) generate a fresh 256-bit (64-hex-char) key with the CSPRNG and
  *       persist it mode 0600 under that home path (never committed).
  */
@@ -136,7 +136,7 @@ function resolveSessionApiKey() {
 
   const persistedKeyPath =
     process.env.OH_SESSION_API_KEY_PATH ||
-    path.join(os.homedir(), ".openhands", "agent-canvas", "dev-local-api-key");
+    path.join(os.homedir(), ".openhands", "OpenHands", "dev-local-api-key");
 
   try {
     const persisted = fs.readFileSync(persistedKeyPath, "utf8").trim();
@@ -203,7 +203,7 @@ function productionPreflight(isProduction) {
     throw new Error(
       `Production requires a built frontend SPA at ` +
         `${path.dirname(CANVAS_BUILD_INDEX)} (missing ${CANVAS_BUILD_INDEX}). ` +
-        `Run 'just setup --production' (or 'cd packages/agent-canvas && npm run build') ` +
+        `Run 'just setup --production' (or 'cd packages/OpenHands && npm run build') ` +
         `before starting the production stack.`,
     );
   }

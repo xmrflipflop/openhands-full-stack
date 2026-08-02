@@ -8,10 +8,8 @@ This repository uses **Git subtrees**. Both upstream projects are committed as o
 
 | Local path | Canonical upstream | Role |
 | --- | --- | --- |
-| `packages/agent-canvas` | [OpenHands/OpenHands](https://github.com/OpenHands/OpenHands) | Self-hostable Agent Canvas application (the monorepo's frontend root) |
+| `packages/OpenHands` | [OpenHands/OpenHands](https://github.com/OpenHands/OpenHands) | Self-hostable Agent Canvas application (the monorepo's frontend root) |
 | `packages/software-agent-sdk` | [OpenHands/software-agent-sdk](https://github.com/OpenHands/software-agent-sdk) | Modular SDK for building software agents |
-
-> The `agent-canvas` subtree is sourced from the OpenHands monorepo — its repository root *is* the `@openhands/agent-canvas` frontend. The standalone `OpenHands/agent-canvas` repository is the retired previous source. The git remote keeps the name `agent-canvas` (the directory prefix and every consumer depend on it), so only its URL and the release-fetch slug redirect to the monorepo. See `docs/prd/7_agent-canvas-source-monomrepo.md`.
 
 ## Layout
 
@@ -23,7 +21,7 @@ This repository uses **Git subtrees**. Both upstream projects are committed as o
 ├── .github/
 │   └── workflows/                 # Workspace CI/CD workflows
 ├── packages/
-│   ├── agent-canvas/              # Git subtree: OpenHands/OpenHands (frontend root)
+│   ├── OpenHands/              # Git subtree: OpenHands/OpenHands (frontend root)
 │   └── software-agent-sdk/        # Git subtree: OpenHands/software-agent-sdk
 ├── docker/
 │   ├── Dockerfile                 # Optional combined workspace image
@@ -115,7 +113,7 @@ just setup --production                   # uv sync + npm install, then build th
 just serve --production --background   # detached, on the global daemon (~/.pm2)
 ```
 
-`just setup --production` writes the bundle to `packages/agent-canvas/build/` (gitignored, never committed). If you change the frontend source, rebuild with `just setup --production` (or `cd packages/agent-canvas && npm run build`) before restarting the stack; starting production without a build fails fast with a message pointing here.
+`just setup --production` writes the bundle to `packages/OpenHands/build/` (gitignored, never committed). If you change the frontend source, rebuild with `just setup --production` (or `cd packages/OpenHands && npm run build`) before restarting the stack; starting production without a build fails fast with a message pointing here.
 
 Then manage it with PM2's own verbs (grouped by the tag namespace):
 
@@ -146,7 +144,7 @@ Run `just` with no arguments to list all recipes. The common ones:
 
 ```bash
 just setup           # bootstrap deps (alloc .dev-id, uv sync, npm install) — also runs just setup-remotes in dev mode — once per checkout
-just setup --production    # same, but builds the agent-canvas production bundle (and skips the git-remote step — not needed to serve) — production mode only
+just setup --production    # same, but builds the Agent Canvas production bundle (and skips the git-remote step — not needed to serve) — production mode only
 just serve           # start the local stack in the foreground (frontend + backend + ingress)
 just serve --background   # detach: leave the stack running on the shared daemon
 just lint            # workspace linters, incl. the PRD reference check
@@ -173,10 +171,10 @@ The workspace pulls updates from the canonical OpenHands repositories. Set up (o
 just setup-remotes
 ```
 
-The recipe is idempotent and prints the configured remotes when done. The `agent-canvas` remote points at the OpenHands monorepo (whose repo root is the agent-canvas frontend); it is equivalent to:
+The recipe is idempotent and prints the configured remotes when done. The `OpenHands` remote points at the OpenHands monorepo (whose repo root is the Agent Canvas frontend); it is equivalent to:
 
 ```bash
-git remote add agent-canvas \
+git remote add OpenHands \
   https://github.com/OpenHands/OpenHands.git
 
 git remote add software-agent-sdk \
@@ -190,19 +188,19 @@ git remote -v
 Pull updates from the OpenHands upstream repositories. `just sync` (and each `just sync-<pkg>`) resolves the `latest` ref to the upstream's most recent GitHub release tag and `git subtree merge`s that tag; pass an explicit `<ref>` for a specific release tag:
 
 ```bash
-just sync                 # both subtrees, at their latest release tag
-just sync-canvas <ref>    # only Agent Canvas, at a specific tag (e.g. v1.8.0)
-just sync-sdk <ref>       # only the SDK, from a specific ref
+just sync                   # both subtrees, at their latest release tag
+just sync-openhands <ref>   # only OpenHands frontend, at a specific tag (e.g. v1.8.0)
+just sync-sdk <ref>         # only the SDK, from a specific ref
 ```
 
-Under the hood they run the standard subtree pulls. The `agent-canvas` fetch hits the OpenHands monorepo:
+Under the hood they run the standard subtree pulls. The `OpenHands` fetch hits the OpenHands monorepo:
 
 ```bash
-# Update Agent Canvas (from the OpenHands monorepo, frontend root)
-git fetch agent-canvas
+# Update OpenHands frontend (from the OpenHands monorepo, frontend root)
+git fetch OpenHands
 git subtree pull \
-  --prefix=packages/agent-canvas \
-  agent-canvas main
+  --prefix=packages/OpenHands \
+  OpenHands main
 
 # Update Software Agent SDK
 git fetch software-agent-sdk
@@ -217,7 +215,7 @@ After pulling, review, validate (`just check`), commit, and push the update:
 
 ```bash
 git status
-git add packages/agent-canvas packages/software-agent-sdk
+git add packages/OpenHands packages/software-agent-sdk
 git commit -m "chore: update OpenHands subtrees"
 git push origin main
 ```

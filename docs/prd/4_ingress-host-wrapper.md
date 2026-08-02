@@ -13,8 +13,8 @@ Workspace-owned; no upstream files are modified.
 | Path | Role |
 | --- | --- |
 | `scripts/dev-local-ingress.mjs` | The wrapper (workspace-owned). Reuses the upstream reverse-proxy internals unmodified and adds only a bind address to `server.listen`, so the ingress can be loopback-only or exposed on demand. |
-| `packages/agent-canvas/scripts/ingress.mjs` | Consumed upstream: the standalone ingress whose `server.listen(config.port, …)` call takes no host argument, so it binds all interfaces with no `--host` flag. |
-| `packages/agent-canvas/scripts/proxy-utils.mjs` | Consumed upstream: the proxy handler internals the wrapper imports unmodified. |
+| `packages/OpenHands/scripts/ingress.mjs` | Consumed upstream: the standalone ingress whose `server.listen(config.port, …)` call takes no host argument, so it binds all interfaces with no `--host` flag. |
+| `packages/OpenHands/scripts/proxy-utils.mjs` | Consumed upstream: the proxy handler internals the wrapper imports unmodified. |
 
 ## Functional requirements
 
@@ -29,7 +29,7 @@ Workspace-owned; no upstream files are modified.
 
 ## Decision points
 
-- **Wrapper vs. patching upstream.** Patching `packages/agent-canvas/scripts/ingress.mjs` to add a host argument was rejected (a subtree edit that creates merge debt on every upstream sync). A thin wrapper that imports the upstream internals and adds the bind step is additive and conflict-free.
+- **Wrapper vs. patching upstream.** Patching `packages/OpenHands/scripts/ingress.mjs` to add a host argument was rejected (a subtree edit that creates merge debt on every upstream sync). A thin wrapper that imports the upstream internals and adds the bind step is additive and conflict-free.
 - **Wrapper vs. no ingress.** A single-origin entry is kept (Option B) so the whole stack is served behind one host:port and the browser makes same-origin API/websocket calls. The wrapper is the price of controlling that entry's bind address.
 
 ## Assumptions (re-check these first when upstream changes)
