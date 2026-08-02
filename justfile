@@ -16,27 +16,32 @@ help:
 # so the run never touches the global ~/.pm2 daemon. Pass --background to detach
 # against the shared daemon instead, and --production to serve the prebuilt SPA.
 # Run `just setup` first.
+#
+# In production mode (--production), automatically builds first since VITE_WORKING_DIR
+# is baked at build time. The same --workspace_dir must be used for build and serve.
+# Can also be set via WORKSPACE_DIR env var.
 serve *args:
+    # Extract --production and --workspace_dir from args for conditional build
+    set -- {{args}}; \
+    production=false; \
+    workspace_dir=""; \
+    while [ $# -gt 0 ]; do \
+        case "$1" in \
+            --production) production=true ;; \
+            --workspace_dir) shift; workspace_dir="$1" ;; \
+        esac; \
+        shift; \
+    done; \
+    if [ "$production" = "true" ]; then \
+        if [ -n "$workspace_dir" ]; then \
+            echo "→ production: building with workspace_dir=$workspace_dir"; \
+            VITE_WORKING_DIR="$workspace_dir/project" npm run build --prefix packages/OpenHands; \
+        else \
+            echo "→ production: building with default workspace"; \
+            npm run build --prefix packages/OpenHands; \
+        fi; \
+    fi; \
     node scripts/launch-stack.js {{args}}
-
-# Start the production stack (builds first, then serves).
-# VITE_WORKING_DIR is baked at build time, so the same workspace_dir must be
-# used for both build and serve. Defaults to <repo_root>/workspace.
-# Can also be set via WORKSPACE_DIR env var.
-serve-prod workspace_dir="":
-    just build workspace_dir="{{workspace_dir}}"
-    just serve --production --workspace_dir "{{workspace_dir}}"
-
-# Build the Agent Canvas production bundle.
-# VITE_WORKING_DIR is baked at build time. For production, pass the same
-# workspace_dir that will be used at serve time. Defaults to <repo_root>/workspace.
-# Can also be set via WORKSPACE_DIR env var.
-build workspace_dir="":
-    if [ -n "{{workspace_dir}}" ]; then \
-        VITE_WORKING_DIR="{{workspace_dir}}/project" npm run build --prefix packages/OpenHands; \
-    else \
-        npm run build --prefix packages/OpenHands; \
-    fi
 
 # Kill all background stack processes for this checkout.
 # Reads .dev-id and deletes both dev-<id> and prod-<id> PM2 namespaces from
@@ -52,12 +57,6 @@ kill *args:
 # worktrees). Every checkout — production included — needs a `.dev-id` now.
 # See docs/prd/5_devid-worktree-allocation.md.
 #
-# Pass `--production` to also build the Agent Canvas production bundle.
-# NOTE: The build step is now DEPRECATED in setup; prefer `just serve-prod`
-# (which builds automatically) or `just build` + `just serve --production`
-# for explicit control. The setup --production build will be removed in a
-# future version.
-#
 # In dev mode (no `--production`) this ALSO runs `just setup-remotes` so a fresh
 # checkout is ready for `just sync` against the upstream subtrees. That step only
 # records remote URLs (no network), is idempotent, and is intentionally skipped
@@ -70,12 +69,7 @@ setup production="false" workspace_dir="":
     cd packages/software-agent-sdk && uv sync
     cd packages/OpenHands && npm install
     if [ "{{production}}" = "true" ]; then \
-        echo "→ --production: building Agent Canvas production bundle (DEPRECATED: use 'just serve-prod' or 'just build' instead)"; \
-        if [ -n "{{workspace_dir}}" ]; then \
-            VITE_WORKING_DIR="{{workspace_dir}}/project" npm run build --prefix packages/OpenHands; \
-        else \
-            npm run build --prefix packages/OpenHands; \
-        fi; \
+        echo "→ --production: skipping frontend build (use 'just serve --production' which builds automatically)"; \
     else \
         echo "→ dev mode: ensuring upstream git remotes (just setup-remotes, idempotent, no network)"; \
         just setup-remotes; \
