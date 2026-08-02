@@ -28,22 +28,13 @@ serve *args:
 # VITE_WORKING_DIR is baked at build time. For production, pass the same
 # workspace_dir that will be used at serve time. Defaults to <repo_root>/workspace.
 # Can also be set via WORKSPACE_DIR env var.
-build *args:
-    # Extract --production and --workspace_dir from args for conditional build
-    set -- {{args}}; \
-    production=false; \
-    workspace_dir=""; \
-    while [ $# -gt 0 ]; do \
-        case "$1" in \
-            --production) production=true ;; \
-            --workspace_dir) shift; workspace_dir="$1" ;; \
-        esac; \
-        shift; \
-    done; \
-    if [ "$production" = "true" ]; then \
-        if [ -n "$workspace_dir" ]; then \
-            echo "→ production: building with workspace_dir=$workspace_dir"; \
-            VITE_WORKING_DIR="$workspace_dir/project" npm run build --prefix packages/OpenHands; \
+[arg("production", long, value="true")]
+[arg("workspace_dir", long)]
+build production="false" workspace_dir="":
+    if [ "{{production}}" = "true" ]; then \
+        if [ -n "{{workspace_dir}}" ]; then \
+            echo "→ production: building with workspace_dir={{workspace_dir}}"; \
+            VITE_WORKING_DIR="{{workspace_dir}}/project" npm run build --prefix packages/OpenHands; \
         else \
             echo "→ production: building with default workspace"; \
             npm run build --prefix packages/OpenHands; \
@@ -72,7 +63,7 @@ kill *args:
 # in production (a deployment does not need the upstream sync remotes). See
 # docs/prd/3_just-task-runner.md FR2b.
 [arg("production", long, value="true")]
-[arg("workspace_dir", long, value="")]
+[arg("workspace_dir", long)]
 setup production="false" workspace_dir="":
     ./scripts/alloc-dev-id.sh
     cd packages/software-agent-sdk && uv sync
