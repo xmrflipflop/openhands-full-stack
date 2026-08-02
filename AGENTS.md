@@ -6,10 +6,10 @@ This repository is an integration workspace for two canonical OpenHands projects
 
 | Local path | Canonical upstream | Git remote |
 | --- | --- | --- |
-| `packages/agent-canvas` | `https://github.com/OpenHands/agent-canvas.git` | `agent-canvas` |
+| `packages/OpenHands` | `https://github.com/OpenHands/OpenHands.git` | `OpenHands` |
 | `packages/software-agent-sdk` | `https://github.com/OpenHands/software-agent-sdk.git` | `software-agent-sdk` |
 
-- `packages/agent-canvas` contains the self-hostable Agent Canvas application.
+- `packages/OpenHands` contains the self-hostable Agent Canvas application (the OpenHands monorepo frontend root).
 - `packages/software-agent-sdk` contains the shared Software Agent SDK.
 - This parent repository owns configuration and code that integrates both packages.
 
@@ -23,7 +23,7 @@ This repository is an integration workspace for two canonical OpenHands projects
 ├── .github/
 │   └── workflows/                 # Workspace CI/CD workflows
 ├── packages/
-│   ├── agent-canvas/              # Git subtree: OpenHands/agent-canvas
+│   ├── OpenHands/              # Git subtree: OpenHands/OpenHands (frontend root)
 │   └── software-agent-sdk/        # Git subtree: OpenHands/software-agent-sdk
 ├── docker/
 │   ├── Dockerfile                 # Optional combined workspace image
@@ -39,7 +39,7 @@ This repository is an integration workspace for two canonical OpenHands projects
 | Path | Ownership and purpose |
 | --- | --- |
 | `justfile` | Workspace task entry points (`just`): wrappers over `scripts/` and workspace shortcuts |
-| `packages/agent-canvas/` | Imported Git subtree from `OpenHands/agent-canvas` |
+| `packages/OpenHands/` | Imported Git subtree from `OpenHands/OpenHands` (the monorepo's frontend root) |
 | `packages/software-agent-sdk/` | Imported Git subtree from `OpenHands/software-agent-sdk` |
 | `docker/Dockerfile` | Workspace container image definition |
 | `docker/compose.yaml` | Workspace local-service orchestration |
@@ -58,7 +58,7 @@ This repository is an integration workspace for two canonical OpenHands projects
 - Treat both directories under `packages/` as imported upstream projects. Preserve their layout, conventions, and local tooling.
 - Follow the Modular and additive changes section below for every change. Its ordering of preferred approaches is mandatory, not advisory.
 - Do not use `git submodule` commands. This repository uses Git subtrees.
-- Do not rename, move, delete, or re-nest `packages/agent-canvas` or `packages/software-agent-sdk` without explicit instruction.
+- Do not rename, move, delete, or re-nest `packages/OpenHands` or `packages/software-agent-sdk` without explicit instruction.
 - Keep workspace-specific integration code and configuration outside `packages/` where possible.
 - Prefer contributing reusable changes to the appropriate canonical OpenHands repository, then importing them through a subtree update.
 - Do not mix subtree updates with unrelated features, formatting, dependency upgrades, or refactors.
@@ -66,14 +66,14 @@ This repository is an integration workspace for two canonical OpenHands projects
 
 ## Modular and additive changes
 
-The overriding goal of this workspace: keep `packages/agent-canvas` and `packages/software-agent-sdk` as close to their upstreams as possible, so that `git subtree pull` (and any rebase of workspace history) stays small and mechanical. Every line changed inside `packages/` is merge debt that must be reconciled again on every upstream sync. Preserve the existing architecture and design of both packages; extend them, do not reshape them.
+The overriding goal of this workspace: keep `packages/OpenHands` and `packages/software-agent-sdk` as close to their upstreams as possible, so that `git subtree pull` (and any rebase of workspace history) stays small and mechanical. Every line changed inside `packages/` is merge debt that must be reconciled again on every upstream sync. Preserve the existing architecture and design of both packages; extend them, do not reshape them.
 
 ### Preferred approaches, in order
 
 When adding or changing functionality, use the first workable option:
 
 1. **Workspace-owned code.** Put integration code, launchers, glue, wrappers, and configuration in workspace directories (`scripts/`, `docker/`, `infra/`, `docs/`, `.github/`). Code outside `packages/` can never conflict with an upstream merge.
-2. **Upstream extension points.** Configure rather than patch. Both packages expose deliberate seams: environment variables (`OH_AGENT_SERVER_LOCAL_PATH`, `VITE_BACKEND_HOST`, `OH_SESSION_API_KEYS_0`, ...), CLI flags (`--host`, `--port`), config files (`packages/agent-canvas/config/defaults.json`), and documented plugin, hook, and adapter APIs. Drive them from workspace-owned scripts or env files.
+2. **Upstream extension points.** Configure rather than patch. Both packages expose deliberate seams: environment variables (`OH_AGENT_SERVER_LOCAL_PATH`, `VITE_BACKEND_HOST`, `OH_SESSION_API_KEYS_0`, ...), CLI flags (`--host`, `--port`), config files (`packages/OpenHands/config/defaults.json`), and documented plugin, hook, and adapter APIs. Drive them from workspace-owned scripts or env files.
 3. **Additive files inside a package.** If code must live inside a package, add new files or modules rather than editing existing ones, and keep the import surface into upstream files as small as possible. New files rarely conflict on merge; edited ones almost always do.
 4. **Surgical edits to upstream files (last resort).** Keep the edit minimal and isolated to the fewest possible lines. Mark every such edit with a `WORKSPACE-PATCH(docs/prd/<number>_<slug>.md):` comment pointing at the PRD that owns it, so conflicting code can be traced back to its requirements without searching.
 
@@ -126,14 +126,14 @@ Each imported package owns its dependency management, build process, formatting,
 Read the package documentation before making changes:
 
 ```bash
-cat packages/agent-canvas/README.md
-cat packages/agent-canvas/docs/DEVELOPMENT.md
+cat packages/OpenHands/README.md
+cat packages/OpenHands/docs/DEVELOPMENT.md
 ```
 
 Run its documented development commands from its package directory:
 
 ```bash
-cd packages/agent-canvas
+cd packages/OpenHands
 npm install
 npm run dev
 ```
@@ -157,7 +157,7 @@ Workspace-level tasks are run with `just` (https://github.com/casey/just) from t
 - `just test` — workspace tests.
 - `just check` — `lint` + `test`; run before declaring work complete.
 - `just setup-remotes` — set up or repair the canonical upstream git remotes (idempotent).
-- `just sync` — pull both upstream subtrees from `main`. The private per-package recipes `sync-canvas` and `sync-sdk` are hidden from the listing but callable directly with an optional ref (e.g. `just sync-canvas feat/x`).
+- `just sync` — pull both upstream subtrees from `main`. The private per-package recipes `sync-openhands` and `sync-sdk` are hidden from the listing but callable directly with an optional ref (e.g. `just sync-openhands feat/x`).
 
 Rules for the justfile:
 
@@ -175,7 +175,7 @@ The full stack runs strictly from this repository's sources, supervised by **PM2
 - **Mode is independent of environment; both axes are free.** Mode (`--production` or not) selects `NODE_ENV` and the frontend serving seam; run style (`--background` or not) selects foreground `pm2-runtime` vs. detached `pm2` against the shared daemon. All four combinations are legal. (Note the runner mapping: `pm2-runtime` is the **foreground** runner; `pm2 start` detaches.)
 - **Ports.** Default ports are `base + id×10`, plus 5 for production (bases 3000 / 18000 / 9000 for frontend / backend / ingress). The production offset moves prod off the round numbers so a dev and a prod of the same id never collide; the step (10) must stay larger than the offset (5). Each of the six ports defaults independently (`--fe_port` etc. override).
 - **Backend** — the OpenHands Agent Server from `packages/software-agent-sdk`. PM2's `script` points at the venv's installed `agent-server` console script (`packages/software-agent-sdk/.venv/bin/agent-server`) with that venv's Python as `interpreter`. `uv sync` materialises the venv with workspace members in editable mode (workspace sources only; never `openhands-*` from PyPI).
-- **Frontend** — the Agent Canvas from `packages/agent-canvas`. The serving seam keys off `NODE_ENV` (this is the only conditional the ecosystem contains, plus its production build preflight): development runs the Vite dev server (`dev:frontend`), proxying `/api` to the local backend via `VITE_BACKEND_HOST`; production serves the prebuilt bundle through the upstream static server (`--session-api-key` injects the resolved session key at runtime). The split exists because the Vite dev server cannot run under `NODE_ENV=production`.
+- **Frontend** — the Agent Canvas from `packages/OpenHands`. The serving seam keys off `NODE_ENV` (this is the only conditional the ecosystem contains, plus its production build preflight): development runs the Vite dev server (`dev:frontend`), proxying `/api` to the local backend via `VITE_BACKEND_HOST`; production serves the prebuilt bundle through the upstream static server (`--session-api-key` injects the resolved session key at runtime). The split exists because the Vite dev server cannot run under `NODE_ENV=production`.
 - **Ingress** — the whole stack behind one origin, routing API/websocket paths to the backend and everything else to the frontend, so the browser makes same-origin calls. Runs via `scripts/dev-local-ingress.mjs` (see `docs/prd/4_ingress-host-wrapper.md`), a thin wrapper that reuses the upstream proxy internals unmodified and adds only a bind address.
 - **Binds** — launcher-owned, one per service, defaulting to loopback (`127.0.0.1`). Loopback is a security property (the stack is unauthenticated by default), so exposing it stays opt-in and explicit: flag, then the legacy `DEV_<service>_BIND` env (kept for continuity), then loopback. The ecosystem no longer reads `DEV_*_BIND` and applies no default of its own.
 
@@ -209,7 +209,7 @@ Keep the remote names and local prefixes stable.
 
 | Upstream | Remote | Local prefix |
 | --- | --- | --- |
-| `OpenHands/agent-canvas` | `agent-canvas` | `packages/agent-canvas` |
+| `OpenHands/OpenHands` (frontend root) | `OpenHands` | `packages/OpenHands` |
 | `OpenHands/software-agent-sdk` | `software-agent-sdk` | `packages/software-agent-sdk` |
 
 Set up or verify remotes (idempotent; prints the configured remotes):
@@ -221,25 +221,25 @@ just setup-remotes
 Confirm upstream default branches before pulling updates:
 
 ```bash
-git ls-remote --symref agent-canvas HEAD
+git ls-remote --symref OpenHands HEAD
 git ls-remote --symref software-agent-sdk HEAD
 ```
 
-Pull canonical upstream changes with the matching prefix:
+Pull canonical upstream changes with the matching prefix. `just sync` (and each `just sync-<pkg>`) resolves the `latest` ref to the upstream's most recent GitHub release tag and `git subtree merge`s that tag; pass an explicit `<ref>` for a specific release tag:
 
 ```bash
-just sync                 # both subtrees, from upstream main
-just sync-canvas <ref>    # one package or a non-main ref
+just sync                  # both subtrees, at their latest release tag
+just sync-openhands <ref>  # OpenHands frontend only, at a specific tag (e.g. v1.8.0)
 just sync-sdk <ref>
 ```
 
-These wrap the standard subtree pulls, which remain the underlying mechanism (run them directly if the recipes are unavailable):
+These wrap the standard subtree pulls, which remain the underlying mechanism (run them directly if the recipes are unavailable). The `OpenHands` remote points at the OpenHands monorepo, so `git fetch OpenHands` fetches the monorepo:
 
 ```bash
-git fetch agent-canvas
+git fetch OpenHands
 git subtree pull \
-  --prefix=packages/agent-canvas \
-  agent-canvas main
+  --prefix=packages/OpenHands \
+  OpenHands main
 
 git fetch software-agent-sdk
 git subtree pull \
@@ -258,24 +258,24 @@ After updating a subtree:
 Example:
 
 ```text
-chore: update agent-canvas subtree
+chore: update OpenHands subtree
 ```
 
 ## Fork workflow
 
 If changes within a subtree should be submitted upstream, use a personal fork rather than pushing to a canonical OpenHands remote.
 
-Optional fork remotes:
+Optional fork remotes. The `OpenHands` fork should be a fork of the OpenHands monorepo (`OpenHands/OpenHands`), since the upstream subtree is sourced from the monorepo's frontend root:
 
 ```bash
-git remote add agent-canvas-fork \
-  https://github.com/xmrflipflop/agent-canvas.git
+git remote add OpenHands-fork \
+  https://github.com/xmrflipflop/OpenHands.git
 
 git remote add software-agent-sdk-fork \
   https://github.com/xmrflipflop/software-agent-sdk.git
 ```
 
-Pull normal updates from the canonical `agent-canvas` and `software-agent-sdk` remotes. Push a split subtree to a personal fork only when intentionally preparing an upstream contribution.
+Pull normal updates from the canonical `OpenHands` and `software-agent-sdk` remotes. Push a split subtree to a personal fork only when intentionally preparing an upstream contribution.
 
 ## Commit messages
 

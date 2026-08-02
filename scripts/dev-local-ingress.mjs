@@ -2,7 +2,7 @@
 /**
  * dev-local-ingress.mjs — workspace-owned ingress runner for the PM2 stack.
  *
- * The upstream standalone ingress (packages/agent-canvas/scripts/ingress.mjs)
+ * The upstream standalone ingress (packages/OpenHands/scripts/ingress.mjs)
  * has no bind-address option: it listens on all interfaces. This wrapper
  * reuses the upstream routing and proxy internals (proxy-utils.mjs, consumed
  * unmodified) and adds only a --host option so the stack port can stay
@@ -29,7 +29,7 @@ import {
   createProxyHandlers,
   createRouter,
   isBenignSocketError,
-} from "../packages/agent-canvas/scripts/proxy-utils.mjs";
+} from "../packages/OpenHands/scripts/proxy-utils.mjs";
 
 function parseArgs(argv) {
   const config = {
