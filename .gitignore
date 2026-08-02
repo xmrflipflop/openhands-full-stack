@@ -1,6 +1,6 @@
 # Workspace-owned ignores. Keeps generated / machine-local artifacts that the
 # PM2-managed dev stack produces out of version control. Nested packages keep
-# their own .gitignore (e.g. agent-canvas ignores node_modules upstream); the
+# their own .gitignore (e.g. OpenHands ignores node_modules upstream); the
 # entries below cover workspace-level and cross-package generated state.
 
 # Per-checkout dev identity (unique positive integer; see docs/prd/1_local-dev-launcher.md FR3).
@@ -24,4 +24,4 @@
 # prod static-server app in ecosystem.config.js. The upstream package's own
 # .gitignore already excludes build/; this is a belt-and-braces workspace guard
 # so the prod build artifact is never committed. (docs/prd/1_local-dev-launcher.md)
-/packages/agent-canvas/build/
+/packages/OpenHands/build/

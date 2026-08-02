@@ -31,7 +31,7 @@
  *             `interpreter` is that venv's python. `uv sync` installs the
  *             workspace members in editable mode, so every openhands-* package
  *             resolves to local sources — never a PyPI release. (FR7)
- *   frontend  Agent Canvas from packages/agent-canvas. The NODE_ENV-appropriate
+ *   frontend  Agent Canvas from packages/OpenHands. The NODE_ENV-appropriate
  *             serving seam is selected here, because `react-router dev` cannot
  *             run under NODE_ENV=production — Vite's SSR JSX transform would
  *             import `react/jsx-runtime` (no `jsxDEV`), crashing the dev server
@@ -43,11 +43,11 @@
  *               • production  → workspace wrapper
  *                 `scripts/prod-frontend-server.mjs` (PM2 entry shim) which
  *                 imports `parseArgs` + `startStaticServer` from upstream
- *                 `packages/agent-canvas/scripts/static-server.mjs`. The
+ *                 `packages/OpenHands/scripts/static-server.mjs`. The
  *                 upstream script guards its entry behind an `isMainModule`
  *                 check that fails under PM2 fork mode, so the wrapper runs
  *                 the exported functions directly. Serves the prebuilt SPA
- *                 from packages/agent-canvas/build/ with history-mode fallback.
+ *                 from packages/OpenHands/build/ with history-mode fallback.
  *                 Its reverse proxy forwards the same /api,/sockets,… prefix
  *                 set as the ingress. The session key is injected at runtime
  *                 via --session-api-key (not baked into the build), preserving
@@ -74,7 +74,7 @@ const path = require("node:path");
 
 const repoRoot = __dirname;
 const SDK_DIR = path.join(repoRoot, "packages", "software-agent-sdk");
-const CANVAS_DIR = path.join(repoRoot, "packages", "agent-canvas");
+const CANVAS_DIR = path.join(repoRoot, "packages", "OpenHands");
 const UV_VENV_PYTHON = path.join(SDK_DIR, ".venv", "bin", "python");
 const AGENT_SERVER_SCRIPT = path.join(SDK_DIR, ".venv", "bin", "agent-server");
 const INGRESS_SCRIPT = path.join(repoRoot, "scripts", "dev-local-ingress.mjs");
@@ -131,7 +131,7 @@ const backendHost = `${backendBind}:${BACKEND_PORT}`;
 
 // Backend URL path prefixes forwarded to the agent-server. A single list
 // shared by three consumers so they route identically: the Vite dev proxy
-// (packages/agent-canvas/vite.config.ts — its mirror, kept in sync here), the
+// (packages/OpenHands/vite.config.ts — its mirror, kept in sync here), the
 // ingress (this ecosystem), and the prod static-server (this ecosystem).
 // Keeping one workspace-owned list prevents the three paths from drifting.
 const backendRoutes = [
@@ -155,7 +155,7 @@ if (isProductionNodeEnv && !fs.existsSync(path.join(CANVAS_BUILD_DIR, "index.htm
   throw new Error(
     `Production requires a built frontend SPA at ${CANVAS_BUILD_DIR} ` +
       `(missing index.html). Run 'just setup --production' (or ` +
-      `'cd packages/agent-canvas && npm run build') before starting the ` +
+      `'cd packages/OpenHands && npm run build') before starting the ` +
       `production stack.`,
   );
 }

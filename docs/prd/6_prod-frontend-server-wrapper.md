@@ -4,7 +4,7 @@
 
 ## Summary
 
-A thin workspace-owned entry shim so the production frontend app starts correctly under PM2 fork mode. Upstream `packages/agent-canvas/scripts/static-server.mjs` guards its entry behind an `isMainModule` check that passes when run directly with `node` but fails when PM2 forks the script — the process comes up `online` under PM2 but binds no port and prints no banner.
+A thin workspace-owned entry shim so the production frontend app starts correctly under PM2 fork mode. Upstream `packages/OpenHands/scripts/static-server.mjs` guards its entry behind an `isMainModule` check that passes when run directly with `node` but fails when PM2 forks the script — the process comes up `online` under PM2 but binds no port and prints no banner.
 
 This wrapper imports the upstream script's exported `parseArgs` and `startStaticServer` functions and calls them directly, bypassing the guard. The arguments, environment, and behaviour are identical to a direct `node` invocation; only the entry mechanism differs.
 
@@ -17,7 +17,7 @@ Workspace-owned; no upstream files are modified.
 | Path | Role |
 | --- | --- |
 | `scripts/prod-frontend-server.mjs` | The wrapper (workspace-owned). Imports `parseArgs` + `startStaticServer` from upstream and runs them unconditionally. |
-| `packages/agent-canvas/scripts/static-server.mjs` | Consumed upstream: the static file server + reverse proxy whose entry is guarded by `isMainModule`. Exports `parseArgs()` and `startStaticServer()` for programmatic use. |
+| `packages/OpenHands/scripts/static-server.mjs` | Consumed upstream: the static file server + reverse proxy whose entry is guarded by `isMainModule`. Exports `parseArgs()` and `startStaticServer()` for programmatic use. |
 | `ecosystem.config.js` | Points PM2 at the wrapper instead of the upstream script for the production frontend app (`script: PROD_FRONTEND_SCRIPT`). |
 
 ## Root cause
@@ -44,7 +44,7 @@ This idiom is correct for `node scripts/static-server.mjs` — `process.argv[1]`
 
 ## Decision points
 
-- **Wrapper vs. patching upstream.** Patching `packages/agent-canvas/scripts/static-server.mjs` to remove or relax the `isMainModule` guard was rejected — it is a subtree edit that creates merge debt on every upstream sync and offers no upstream benefit. A thin wrapper that imports the upstream exports is additive and conflict-free.
+- **Wrapper vs. patching upstream.** Patching `packages/OpenHands/scripts/static-server.mjs` to remove or relax the `isMainModule` guard was rejected — it is a subtree edit that creates merge debt on every upstream sync and offers no upstream benefit. A thin wrapper that imports the upstream exports is additive and conflict-free.
 - **Wrapper vs. PM2 `--interpreter_args`.** PM2 does not support overriding how Node resolves `process.argv[1]`; the fork harness is internal to PM2. No PM2 configuration can make the guard pass.
 - **Wrapper vs. `exec_mode: cluster_mode`.** Cluster mode uses worker threads and a different fork semantics, but the static server uses HTTP APIs incompatible with cluster-mode worker threads. Fork mode is the correct PM2 strategy; the wrapper is the correct fix.
 

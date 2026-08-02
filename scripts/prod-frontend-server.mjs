@@ -2,7 +2,7 @@
  * Workspace-owned PM2 entry point for the upstream agent-canvas static server.
  *
  * Background (PRD: docs/prd/1_local-dev-launcher.md, FR8 prod):
- *   The upstream `packages/agent-canvas/scripts/static-server.mjs` guards its
+ *   The upstream `packages/OpenHands/scripts/static-server.mjs` guards its
  *   entry on an `isMainModule` check:
  *
  *     const isMainModule =
@@ -16,7 +16,7 @@
  *   under PM2 but binds no port and prints no banner.
  *
  *   This is an upstream-file quirk we deliberately do NOT patch inside
- *   `packages/agent-canvas`. The upstream script already *exports*
+ *   `packages/OpenHands`. The upstream script already *exports*
  *   `parseArgs` and `startStaticServer`, so this workspace-owned wrapper drives
  *   them directly — the ecosystem points PM2 at this file instead of the
  *   upstream script. The args/env remain identical to a direct run, so behaviour
@@ -25,7 +25,7 @@
  *   retired and the ecosystem pointed back at the upstream script.
  */
 
-import { parseArgs, startStaticServer } from "../packages/agent-canvas/scripts/static-server.mjs";
+import { parseArgs, startStaticServer } from "../packages/OpenHands/scripts/static-server.mjs";
 
 try {
   const config = parseArgs();
