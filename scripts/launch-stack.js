@@ -123,21 +123,17 @@ function readDevId(devIdFile) {
 }
 
 /**
- * Resolve the session API key by the exact chain the old ecosystem used
- * (MOVED here unchanged — FR8b). Precedence:
+ * Resolve the session API key. Precedence:
  *   (1) LOCAL_BACKEND_API_KEY env var;
- *   (2) the persisted key at OH_SESSION_API_KEY_PATH (default
- *       ~/.openhands/OpenHands/dev-local-api-key); if missing/empty,
+ *   (2) the persisted key at <workspace_dir>/dev-local-api-key; if missing/empty,
  *   (3) generate a fresh 256-bit (64-hex-char) key with the CSPRNG and
- *       persist it mode 0600 under that home path (never committed).
+ *       persist it mode 0600 under that workspace path (never committed).
  */
-function resolveSessionApiKey() {
+function resolveSessionApiKey(workspaceDir) {
   const fromEnv = (process.env.LOCAL_BACKEND_API_KEY || "").trim();
   if (fromEnv) return fromEnv;
 
-  const persistedKeyPath =
-    process.env.OH_SESSION_API_KEY_PATH ||
-    path.join(os.homedir(), ".openhands", "OpenHands", "dev-local-api-key");
+  const persistedKeyPath = path.join(workspaceDir, "dev-local-api-key");
 
   try {
     const persisted = fs.readFileSync(persistedKeyPath, "utf8").trim();
@@ -238,7 +234,6 @@ function resolve(values) {
   const ingressBind = resolveBind("ingress", values.ingress_bind);
 
   productionPreflight(isProduction);
-  const sessionApiKey = resolveSessionApiKey();
 
   // Resolve workspace directory: flag -> env var -> default (repo_root/workspace)
   const workspaceDirFlag = values.workspace_dir;
@@ -262,6 +257,9 @@ function resolve(values) {
   }
   conversationsDir = path.join(workspaceDir, 'conversations');
   bashEventsDir = path.join(workspaceDir, 'bash_events');
+
+  // Resolve session API key using the workspace directory for persistence
+  const sessionApiKey = resolveSessionApiKey(workspaceDir);
 
   // The frontend's per-conversation working dir for conversations started
   // WITHOUT an explicit workspace. The frontend computes it from
