@@ -21,6 +21,14 @@ help:
 # is baked at build time. The same --workspace_dir must be used for build and serve.
 # Can also be set via WORKSPACE_DIR env var.
 serve *args:
+    just build {{args}}
+    node scripts/launch-stack.js {{args}}
+
+# Build the Agent Canvas production bundle (no-op in dev mode).
+# VITE_WORKING_DIR is baked at build time. For production, pass the same
+# workspace_dir that will be used at serve time. Defaults to <repo_root>/workspace.
+# Can also be set via WORKSPACE_DIR env var.
+build *args:
     # Extract --production and --workspace_dir from args for conditional build
     set -- {{args}}; \
     production=false; \
@@ -40,8 +48,9 @@ serve *args:
             echo "→ production: building with default workspace"; \
             npm run build --prefix packages/OpenHands; \
         fi; \
-    fi; \
-    node scripts/launch-stack.js {{args}}
+    else \
+        echo "→ dev mode: no build needed"; \
+    fi
 
 # Kill all background stack processes for this checkout.
 # Reads .dev-id and deletes both dev-<id> and prod-<id> PM2 namespaces from
