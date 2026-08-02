@@ -41,19 +41,32 @@ kill *args:
 # `--production` (and `just serve`'s) so the surface is uniform. Dev-mode
 # checkouts never need `--production`.
 #
+# Pass `--workspace_dir` to set the base directory for agent-server data and
+# the per-conversation working-dir base (VITE_WORKING_DIR). This is REQUIRED
+# for `--production` because VITE_WORKING_DIR is baked into the production
+# bundle at build time and cannot be changed at serve time. The same
+# `--workspace_dir` must be passed to both `just setup --production` and
+# `just serve --production` for consistency. Defaults to <repo_root>/workspace.
+# Can also be set via WORKSPACE_DIR env var.
+#
 # In dev mode (no `--production`) this ALSO runs `just setup-remotes` so a fresh
 # checkout is ready for `just sync` against the upstream subtrees. That step only
 # records remote URLs (no network), is idempotent, and is intentionally skipped
 # in production (a deployment does not need the upstream sync remotes). See
 # docs/prd/3_just-task-runner.md FR2b.
 [arg("production", long, value="true")]
-setup production="false":
+[arg("workspace_dir", long, value="")]
+setup production="false" workspace_dir="":
     ./scripts/alloc-dev-id.sh
     cd packages/software-agent-sdk && uv sync
     cd packages/OpenHands && npm install
     if [ "{{production}}" = "true" ]; then \
         echo "→ --production: building Agent Canvas production bundle (npm run build)"; \
-        npm run build --prefix packages/OpenHands; \
+        if [ -n "{{workspace_dir}}" ]; then \
+            VITE_WORKING_DIR="{{workspace_dir}}/project" npm run build --prefix packages/OpenHands; \
+        else \
+            npm run build --prefix packages/OpenHands; \
+        fi; \
     else \
         echo "→ dev mode: ensuring upstream git remotes (just setup-remotes, idempotent, no network)"; \
         just setup-remotes; \
