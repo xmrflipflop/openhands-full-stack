@@ -19,6 +19,25 @@ help:
 serve *args:
     node scripts/launch-stack.js {{args}}
 
+# Start the production stack (builds first, then serves).
+# VITE_WORKING_DIR is baked at build time, so the same workspace_dir must be
+# used for both build and serve. Defaults to <repo_root>/workspace.
+# Can also be set via WORKSPACE_DIR env var.
+serve-prod workspace_dir="":
+    just build workspace_dir="{{workspace_dir}}"
+    just serve --production --workspace_dir "{{workspace_dir}}"
+
+# Build the Agent Canvas production bundle.
+# VITE_WORKING_DIR is baked at build time. For production, pass the same
+# workspace_dir that will be used at serve time. Defaults to <repo_root>/workspace.
+# Can also be set via WORKSPACE_DIR env var.
+build workspace_dir="":
+    if [ -n "{{workspace_dir}}" ]; then \
+        VITE_WORKING_DIR="{{workspace_dir}}/project" npm run build --prefix packages/OpenHands; \
+    else \
+        npm run build --prefix packages/OpenHands; \
+    fi
+
 # Kill all background stack processes for this checkout.
 # Reads .dev-id and deletes both dev-<id> and prod-<id> PM2 namespaces from
 # the shared daemon. Idempotent (exits 0 if nothing was running). Works
@@ -33,21 +52,11 @@ kill *args:
 # worktrees). Every checkout — production included — needs a `.dev-id` now.
 # See docs/prd/5_devid-worktree-allocation.md.
 #
-# Pass `--production` to additionally build the Agent Canvas production bundle
-# into packages/OpenHands/build/. The production launcher serves this
-# prebuilt SPA (NODE_ENV=production is incompatible with `react-router dev`, so
-# production does NOT run the Vite dev server — see ecosystem.config.js and
-# docs/prd/1_local-dev-launcher.md FR8). The flag name matches the launcher's
-# `--production` (and `just serve`'s) so the surface is uniform. Dev-mode
-# checkouts never need `--production`.
-#
-# Pass `--workspace_dir` to set the base directory for agent-server data and
-# the per-conversation working-dir base (VITE_WORKING_DIR). This is REQUIRED
-# for `--production` because VITE_WORKING_DIR is baked into the production
-# bundle at build time and cannot be changed at serve time. The same
-# `--workspace_dir` must be passed to both `just setup --production` and
-# `just serve --production` for consistency. Defaults to <repo_root>/workspace.
-# Can also be set via WORKSPACE_DIR env var.
+# Pass `--production` to also build the Agent Canvas production bundle.
+# NOTE: The build step is now DEPRECATED in setup; prefer `just serve-prod`
+# (which builds automatically) or `just build` + `just serve --production`
+# for explicit control. The setup --production build will be removed in a
+# future version.
 #
 # In dev mode (no `--production`) this ALSO runs `just setup-remotes` so a fresh
 # checkout is ready for `just sync` against the upstream subtrees. That step only
@@ -61,7 +70,7 @@ setup production="false" workspace_dir="":
     cd packages/software-agent-sdk && uv sync
     cd packages/OpenHands && npm install
     if [ "{{production}}" = "true" ]; then \
-        echo "→ --production: building Agent Canvas production bundle (npm run build)"; \
+        echo "→ --production: building Agent Canvas production bundle (DEPRECATED: use 'just serve-prod' or 'just build' instead)"; \
         if [ -n "{{workspace_dir}}" ]; then \
             VITE_WORKING_DIR="{{workspace_dir}}/project" npm run build --prefix packages/OpenHands; \
         else \
