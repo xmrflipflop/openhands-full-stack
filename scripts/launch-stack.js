@@ -42,6 +42,12 @@
  *     [--ingress_port N] [--fe_bind A] [--be_bind A] [--ingress_bind A] \
  *     [--workspace_dir PATH] [--background] [--production] [--dry-run] [--stop]
  *
+ * --workspace_dir: base directory for all agent-server data (conversations,
+ *   bash events, session API key). Defaults to <repo_root>/workspace.
+ *   Can also be set via WORKSPACE_DIR env var. Each checkout/worktree can
+ *   use a different workspace_dir for isolation. The session API key is
+ *   persisted at <workspace_dir>/dev-local-api-key.
+ *
  * --stop: stop and delete the background stack for this checkout. Respects
  *   --production: `--stop` alone stops dev-<id>; `--production --stop` stops
  *   prod-<id>. Reads .dev-id and deletes only the matching namespace from the
@@ -427,7 +433,7 @@ function main() {
     console.error(
       `Usage: node scripts/launch-stack.js [--fe_port N] [--be_port N] ` +
         `[--ingress_port N] [--fe_bind A] [--be_bind A] [--ingress_bind A] ` +
-        `[--background] [--production] [--dry-run] [--stop]`,
+        `[--workspace_dir PATH] [--background] [--production] [--dry-run] [--stop]`,
     );
     process.exit(2);
   }
