@@ -7,26 +7,18 @@ set shell := ["bash", "-cu"]
 help:
     @just --list
 
-# Start the local stack in the FOREGROUND (default): backend + frontend +
-# ingress, streamed logs, Ctrl-C stops everything. Forwards all flags unchanged
-# to scripts/launch-stack.js (the only supported entry point), which resolves
-# every deployment value (per-checkout id, tag, ports, binds, session key,
-# workspace directory, NODE_ENV) and hands them to ecosystem.config.js as STACK_* env vars.
-# Foreground runs `pm2-runtime` against a THROWAWAY PM2_HOME keyed on the tag,
-# so the run never touches the global ~/.pm2 daemon. Pass --background to detach
-# against the shared daemon instead, and --production to serve the prebuilt SPA.
-# Run `just setup` first.
-#
-# In production mode (--production), automatically builds first since VITE_WORKING_DIR
-# is baked at build time. The same --workspace_dir must be used for build and serve.
-# Can also be set via WORKSPACE_DIR env var.
+# Start the stack in the FOREGROUND (Ctrl-C stops everything).
+# Forwards all flags to scripts/launch-stack.js (the only supported entry point).
+# In production mode (--production), auto-builds first since VITE_WORKING_DIR
+# is baked at build time (FR8c, FR20). Same --workspace_dir must be used for
+# build and serve. Run `just setup` first.
 serve *args:
     just build {{args}}
     node scripts/launch-stack.js {{args}}
 
 # Build the Agent Canvas production bundle (no-op in dev mode).
 # VITE_WORKING_DIR is baked at build time. For production, pass the same
-# workspace_dir that will be used at serve time. Defaults to <repo_root>/workspace.
+# workspace_dir that will be used at serve time (defaults to <repo_root>/workspace).
 # Can also be set via WORKSPACE_DIR env var.
 [arg("production", long, value="true")]
 [arg("workspace_dir", long)]
@@ -43,25 +35,16 @@ build production="false" workspace_dir="":
         echo "→ dev mode: no build needed"; \
     fi
 
-# Kill all background stack processes for this checkout.
-# Reads .dev-id and deletes both dev-<id> and prod-<id> PM2 namespaces from
-# the shared daemon. Idempotent (exits 0 if nothing was running). Works
-# across branch switches because .dev-id is stable (gitignored).
-# Pass --kill directly to the launcher; all other flags are ignored by --kill.
+# Kill background stack processes for this checkout.
+# Reads .dev-id and deletes dev-<id>/prod-<id> PM2 namespaces. Idempotent.
+# Pass --kill directly to the launcher; all other flags ignored.
 kill *args:
     node scripts/launch-stack.js --kill {{args}}
 
-# Bootstrap dependencies the stack expects (run once per checkout).
-# Allocates the per-checkout `.dev-id` first so the launcher can derive a unique
-# app-name tag (dev-<id>/prod-<id>) and port block (idempotent; supports git
-# worktrees). Every checkout — production included — needs a `.dev-id` now.
-# See docs/prd/5_devid-worktree-allocation.md.
-#
-# In dev mode (no `--production`) this ALSO runs `just setup-remotes` so a fresh
-# checkout is ready for `just sync` against the upstream subtrees. That step only
-# records remote URLs (no network), is idempotent, and is intentionally skipped
-# in production (a deployment does not need the upstream sync remotes). See
-# docs/prd/3_just-task-runner.md FR2b.
+# Bootstrap dependencies (run once per checkout).
+# Allocates .dev-id, runs uv sync + npm install.
+# In dev mode (no --production), also sets up upstream git remotes.
+# See docs/prd/5_devid-worktree-allocation.md and docs/prd/3_just-task-runner.md FR2b.
 [arg("production", long, value="true")]
 [arg("workspace_dir", long)]
 setup production="false" workspace_dir="":
@@ -89,9 +72,6 @@ lint *args:
   ./scripts/check-prd-refs.sh
 
 # Set up the canonical upstream git remotes.
-# The `OpenHands` remote points at the OpenHands monorepo
-# (https://github.com/OpenHands/OpenHands), whose repo root IS the
-# @openhands/agent-canvas frontend.
 setup-remotes:
     git remote add OpenHands https://github.com/OpenHands/OpenHands.git || git remote set-url OpenHands https://github.com/OpenHands/OpenHands.git
     git remote add software-agent-sdk https://github.com/OpenHands/software-agent-sdk.git || git remote set-url software-agent-sdk https://github.com/OpenHands/software-agent-sdk.git
