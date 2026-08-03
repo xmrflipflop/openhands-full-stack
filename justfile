@@ -9,31 +9,8 @@ help:
 
 # Start the stack in the FOREGROUND (Ctrl-C stops everything).
 # Forwards all flags to scripts/launch-stack.js (the only supported entry point).
-# In production mode (--production), auto-builds first since VITE_WORKING_DIR
-# is baked at build time (FR8c, FR20). Same --workspace_dir must be used for
-# build and serve. Run `just setup` first.
 serve *args:
-    just build {{args}}
     node scripts/launch-stack.js {{args}}
-
-# Build the Agent Canvas production bundle (no-op in dev mode).
-# VITE_WORKING_DIR is baked at build time. For production, pass the same
-# workspace_dir that will be used at serve time (defaults to <repo_root>/workspace).
-# Can also be set via WORKSPACE_DIR env var.
-[arg("production", long, value="true")]
-[arg("workspace_dir", long)]
-build production="false" workspace_dir="":
-    if [ "{{production}}" = "true" ]; then \
-        if [ -n "{{workspace_dir}}" ]; then \
-            echo "→ production: building with workspace_dir={{workspace_dir}}"; \
-            VITE_WORKING_DIR="{{workspace_dir}}/project" npm run build --prefix packages/OpenHands; \
-        else \
-            echo "→ production: building with default workspace"; \
-            npm run build --prefix packages/OpenHands; \
-        fi; \
-    else \
-        echo "→ dev mode: no build needed"; \
-    fi
 
 # Kill background stack processes for this checkout.
 # Reads .dev-id and deletes dev-<id>/prod-<id> PM2 namespaces. Idempotent.
