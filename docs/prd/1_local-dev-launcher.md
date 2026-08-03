@@ -10,13 +10,13 @@ The stack is started by one launcher — `scripts/launch-stack.js`, the only sup
 
 Mode and run style are two independent axes. **Mode** (`--production` or not) selects `NODE_ENV` and the frontend serving seam: development runs the Vite dev server, production serves a prebuilt bundle through the upstream static server — because the Vite dev server cannot run under `NODE_ENV=production`. **Run style** (`--background` or not) selects foreground `pm2-runtime` (default, with a throwaway `PM2_HOME` keyed on the tag) vs. detached `pm2` against the shared daemon. All four combinations are legal.
 
-The production build is out-of-band and not part of the PM2 lifecycle. The launcher uses a git SHA-based build cache (stored at `packages/OpenHands/.build-cache.json`) to determine if a rebuild is necessary. The cache key includes the git SHA with a `-dirty` suffix when there are uncommitted changes in `packages/OpenHands`. A rebuild is triggered when:
+The production build is out-of-band and not part of the PM2 lifecycle. The launcher uses a git SHA-based build cache (stored at `packages/OpenHands/build/.build-cache.json`, alongside the build artifacts) to determine if a rebuild is necessary. The cache key includes the git SHA with a `-dirty` suffix when there are uncommitted changes in `packages/OpenHands`. A rebuild is triggered when:
 - No cache exists (first production run)
 - The git SHA has changed (new commits or dirty state)
 - `VITE_WORKING_DIR` has changed since the last build
 - The build command has changed
 
-If the cache is invalid, the launcher runs `npm run build --prefix packages/OpenHands` with the correct `VITE_WORKING_DIR` automatically, then updates the cache. If the cache is valid, the launcher skips the build entirely and uses the existing bundle. The launcher verifies the built bundle exists (`--production` fails fast if missing; FR8c).
+If the cache is invalid, the launcher deletes the old `packages/OpenHands/build/` directory, then runs `npm run build --prefix packages/OpenHands` with the correct `VITE_WORKING_DIR` automatically, then updates the cache. If the cache is valid, the launcher skips the build entirely and uses the existing bundle. The launcher verifies the built bundle exists (`--production` fails fast if missing; FR8c).
 
 ## Scope
 

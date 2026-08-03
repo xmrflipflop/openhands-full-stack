@@ -67,15 +67,10 @@ const PORT_MAX = 65535;
 const LOOPBACK = "127.0.0.1";
 
 const DEV_ID_FILE = path.join(REPO_ROOT, ".dev-id");
-const CANVAS_BUILD_INDEX = path.join(
-  REPO_ROOT,
-  "packages",
-  "OpenHands",
-  "build",
-  "index.html",
-);
+const CANVAS_BUILD_DIR = path.join(REPO_ROOT, "packages", "OpenHands", "build");
+const CANVAS_BUILD_INDEX = path.join(CANVAS_BUILD_DIR, "index.html");
 const ECOSYSTEM_FILE = path.join(REPO_ROOT, "ecosystem.config.js");
-const BUILD_CACHE_FILE = path.join(REPO_ROOT, "packages", "OpenHands", ".build-cache.json");
+const BUILD_CACHE_FILE = path.join(CANVAS_BUILD_DIR, ".build-cache.json");
 
 const BUILD_COMMAND = "npm run build --prefix packages/OpenHands";
 
@@ -281,9 +276,14 @@ function checkBuildCache() {
 function runBuild() {
   const viteWorkingDir = process.env.VITE_WORKING_DIR || path.join(REPO_ROOT, "workspace", "project");
   
+  // Delete old build directory if it exists
+  if (fs.existsSync(CANVAS_BUILD_DIR)) {
+    console.log(`[run-stack] Removing old build directory: ${CANVAS_BUILD_DIR}`);
+    fs.rmSync(CANVAS_BUILD_DIR, { recursive: true, force: true });
+  }
+  
   // Ensure the build directory exists
-  const buildDir = path.dirname(CANVAS_BUILD_INDEX);
-  fs.mkdirSync(buildDir, { recursive: true });
+  fs.mkdirSync(CANVAS_BUILD_DIR, { recursive: true });
 
   // Run the build
   try {
