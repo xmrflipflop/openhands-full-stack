@@ -52,7 +52,7 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const os = require("node:os");
-const { spawn } = require("node:child_process");
+const { spawn, execSync } = require("node:child_process");
 const { parseArgs } = require("node:util");
 
 const LAUNCHER_PATH = __filename;
@@ -75,6 +75,9 @@ const CANVAS_BUILD_INDEX = path.join(
   "index.html",
 );
 const ECOSYSTEM_FILE = path.join(REPO_ROOT, "ecosystem.config.js");
+const BUILD_CACHE_FILE = path.join(REPO_ROOT, "packages", "OpenHands", ".build-cache.json");
+
+const BUILD_COMMAND = "npm run build --prefix packages/OpenHands";
 
 // ── Pure resolution ──────────────────────────────────────────────────────────
 
@@ -195,14 +198,130 @@ function resolveBind(service, flagValue) {
 
 function productionPreflight(isProduction) {
   if (!isProduction) return;
+  
+  // Check if build is valid or needs rebuild
+  const buildCheck = checkBuildCache();
+  if (!buildCheck.valid) {
+    console.log(`[run-stack] ${buildCheck.reason}`);
+    console.log(`[run-stack] Building production frontend...`);
+    runBuild();
+  }
+  
   if (!fs.existsSync(CANVAS_BUILD_INDEX)) {
     throw new Error(
       `Production requires a built frontend SPA at ` +
         `${path.dirname(CANVAS_BUILD_INDEX)} (missing ${CANVAS_BUILD_INDEX}). ` +
-        `Run 'just setup --production' (or 'cd packages/OpenHands && npm run build') ` +
-        `before starting the production stack.`,
+        `Build failed or was not executed.`,
     );
   }
+}
+
+/**
+ * Check if the build cache is valid.
+ * Returns { valid: boolean, reason: string }.
+ * Cache is invalid if:
+ * - No cache file exists
+ * - Git SHA has changed (new commits)
+ * - There are uncommitted changes in packages/OpenHands
+ * - VITE_WORKING_DIR has changed since last build
+ * - Build command has changed
+ */
+function checkBuildCache() {
+  if (!fs.existsSync(BUILD_CACHE_FILE)) {
+    return { valid: false, reason: "No build cache found. First production run." };
+  }
+
+  let cache;
+  try {
+    cache = JSON.parse(fs.readFileSync(BUILD_CACHE_FILE, "utf8"));
+  } catch {
+    return { valid: false, reason: "Build cache corrupted. Rebuilding." };
+  }
+
+  // Get current git SHA
+  let currentSha;
+  try {
+    currentSha = execSync("git rev-parse HEAD", { cwd: REPO_ROOT, encoding: "utf8" }).trim();
+  } catch {
+    return { valid: false, reason: "Failed to get git SHA. Rebuilding." };
+  }
+
+  if (cache.gitSha !== currentSha) {
+    return { valid: false, reason: `Git SHA changed (${cache.gitSha.substring(0, 8)} -> ${currentSha.substring(0, 8)}). Rebuilding.` };
+  }
+
+  // Check for uncommitted changes in packages/OpenHands
+  let hasUncommitted;
+  try {
+    const status = execSync("git status --porcelain packages/OpenHands", { cwd: REPO_ROOT, encoding: "utf8" });
+    hasUncommitted = status.trim().length > 0;
+  } catch {
+    return { valid: false, reason: "Failed to check git status. Rebuilding." };
+  }
+
+  if (hasUncommitted) {
+    return { valid: false, reason: "Uncommitted changes in packages/OpenHands. Rebuilding." };
+  }
+
+  // Check if VITE_WORKING_DIR has changed
+  const currentViteWorkingDir = process.env.VITE_WORKING_DIR || path.join(REPO_ROOT, "workspace", "project");
+  if (cache.viteWorkingDir !== currentViteWorkingDir) {
+    return { valid: false, reason: `VITE_WORKING_DIR changed (${cache.viteWorkingDir} -> ${currentViteWorkingDir}). Rebuilding.` };
+  }
+
+  // Check if build command has changed
+  if (cache.buildCommand !== BUILD_COMMAND) {
+    return { valid: false, reason: `Build command changed. Rebuilding.` };
+  }
+
+  return { valid: true, reason: "Build cache valid." };
+}
+
+/**
+ * Run the production build with the correct VITE_WORKING_DIR.
+ */
+function runBuild() {
+  const viteWorkingDir = process.env.VITE_WORKING_DIR || path.join(REPO_ROOT, "workspace", "project");
+  
+  // Ensure the build directory exists
+  const buildDir = path.dirname(CANVAS_BUILD_INDEX);
+  fs.mkdirSync(buildDir, { recursive: true });
+
+  // Run the build
+  try {
+    execSync(BUILD_COMMAND, {
+      cwd: REPO_ROOT,
+      env: { ...process.env, VITE_WORKING_DIR: viteWorkingDir },
+      stdio: "inherit",
+    });
+  } catch (err) {
+    throw new Error(`Build failed: ${err.message}`);
+  }
+
+  // Write cache after successful build
+  writeBuildCache(viteWorkingDir);
+}
+
+/**
+ * Write the build cache with current state.
+ */
+function writeBuildCache(viteWorkingDir) {
+  let currentSha;
+  try {
+    currentSha = execSync("git rev-parse HEAD", { cwd: REPO_ROOT, encoding: "utf8" }).trim();
+  } catch {
+    // If we can't get SHA, write cache anyway without it
+    currentSha = "unknown";
+  }
+
+  const cache = {
+    gitSha: currentSha,
+    viteWorkingDir,
+    buildCommand: BUILD_COMMAND,
+    builtAt: new Date().toISOString(),
+  };
+
+  fs.writeFileSync(BUILD_CACHE_FILE, JSON.stringify(cache, null, 2));
 }
 
 /**
