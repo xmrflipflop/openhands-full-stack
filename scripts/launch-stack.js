@@ -221,8 +221,7 @@ function productionPreflight(isProduction) {
  * Returns { valid: boolean, reason: string }.
  * Cache is invalid if:
  * - No cache file exists
- * - Git SHA has changed (new commits)
- * - There are uncommitted changes in packages/OpenHands
+ * - Git SHA has changed (new commits or dirty state)
  * - VITE_WORKING_DIR has changed since last build
  * - Build command has changed
  */
@@ -238,16 +237,12 @@ function checkBuildCache() {
     return { valid: false, reason: "Build cache corrupted. Rebuilding." };
   }
 
-  // Get current git SHA
+  // Get current git SHA with dirty check
   let currentSha;
   try {
     currentSha = execSync("git rev-parse HEAD", { cwd: REPO_ROOT, encoding: "utf8" }).trim();
   } catch {
     return { valid: false, reason: "Failed to get git SHA. Rebuilding." };
-  }
-
-  if (cache.gitSha !== currentSha) {
-    return { valid: false, reason: `Git SHA changed (${cache.gitSha.substring(0, 8)} -> ${currentSha.substring(0, 8)}). Rebuilding.` };
   }
 
   // Check for uncommitted changes in packages/OpenHands
@@ -259,8 +254,11 @@ function checkBuildCache() {
     return { valid: false, reason: "Failed to check git status. Rebuilding." };
   }
 
-  if (hasUncommitted) {
-    return { valid: false, reason: "Uncommitted changes in packages/OpenHands. Rebuilding." };
+  // Append -dirty suffix if there are uncommitted changes
+  const effectiveSha = hasUncommitted ? `${currentSha}-dirty` : currentSha;
+
+  if (cache.gitSha !== effectiveSha) {
+    return { valid: false, reason: `Git SHA changed (${cache.gitSha.substring(0, 8)} -> ${effectiveSha.substring(0, 8)}). Rebuilding.` };
   }
 
   // Check if VITE_WORKING_DIR has changed
@@ -314,8 +312,20 @@ function writeBuildCache(viteWorkingDir) {
     currentSha = "unknown";
   }
 
+  // Check for uncommitted changes in packages/OpenHands
+  let hasUncommitted;
+  try {
+    const status = execSync("git status --porcelain packages/OpenHands", { cwd: REPO_ROOT, encoding: "utf8" });
+    hasUncommitted = status.trim().length > 0;
+  } catch {
+    hasUncommitted = false;
+  }
+
+  // Append -dirty suffix if there are uncommitted changes
+  const effectiveSha = hasUncommitted ? `${currentSha}-dirty` : currentSha;
+
   const cache = {
-    gitSha: currentSha,
+    gitSha: effectiveSha,
     viteWorkingDir,
     buildCommand: BUILD_COMMAND,
     builtAt: new Date().toISOString(),
