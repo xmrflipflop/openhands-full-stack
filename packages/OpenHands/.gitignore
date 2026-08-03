@@ -34,6 +34,7 @@ ralph/
 # Local runtime artifacts produced by static-server / agent-server runs
 workspace/
 build-fresh/
+.build-cache.json
 
 # Electron desktop build outputs
 /dist-electron/
