@@ -5,47 +5,46 @@
  * PRD: docs/prd/1_local-dev-launcher.md
  *
  * Resolves every deployment-specific value (production mode, per-checkout
- * id, app-name tag, ports, bind addresses, session API key, NODE_ENV) and
- * hands the result to PM2 as environment variables that
- * `ecosystem.config.js` consumes. The ecosystem derives NOTHING: it reads
- * `STACK_*` / `NODE_ENV` and hard-errors if a required value is absent,
- * so a bare `pm2 start ecosystem.config.js` fails immediately and names
- * this launcher (FR15). Starting the stack requires this launcher.
+ * id, app-name tag, ports, bind addresses, session API key, NODE_ENV,
+ * workspace_dir and its derived paths) and hands the result to PM2 as
+ * environment variables that `ecosystem.config.js` consumes. The ecosystem
+ * derives NOTHING: it reads STACK_* / NODE_ENV and hard-errors if a required
+ * value is absent (FR15).
  *
  * Responsibilities (FR1):
  *   - Parse flags (FR2).
- *   - Validate `.dev-id`: required for every checkout, incl. production;
+ *   - Validate .dev-id: required for every checkout, incl. production;
  *     validate, never allocate (FR3).
  *   - Resolve ports: each of the six port flags defaults independently;
  *     the computed default is base + id*10, plus 5 for production (FR5).
  *   - Compose the tag `dev-<id>` / `prod-<id>` (FR4), used verbatim as the
  *     app-name suffix, PM2 namespace, and log subdirectory.
- *   - Resolve the session API key by the exact chain the old ecosystem used
- *     (LOCAL_BACKEND_API_KEY -> persisted key -> generated + persisted),
- *     MOVED here unchanged (FR8b). The ecosystem fans the resolved key out
- *     to its three consumers.
- *   - Resolve bind addresses: flag -> legacy DEV_*_BIND env -> loopback
- *     (FR17). Loopback is a security property, not a convenience.
- *   - Production preflight: abort if the prebuilt frontend is missing
- *     (FR8c). The ecosystem repeats this as a backstop.
+ *   - Resolve the session API key: LOCAL_BACKEND_API_KEY env ->
+ *     <workspace_dir>/dev-local-api-key -> generate + persist (FR8b).
+ *   - Resolve bind addresses: flag -> legacy DEV_*_BIND env -> loopback (FR17).
+ *   - Production preflight: abort if the prebuilt frontend is missing (FR8c).
  *   - Hand off to PM2: foreground (default) via `pm2-runtime start` with a
  *     throwaway PM2_HOME keyed on the tag; `--background` via `pm2 start`
  *     against the shared daemon (FR13). `--dry-run` prints the resolved env
- *     and starts nothing.
+ *     and starts nothing. `--stop` deletes the background stack namespace.
  *
  * No dependencies beyond Node (PM2 guarantees Node is present). Resolution
- * is a pure function (NFR6), separate from spawning, and testable without
- * PM2.
+ * is a pure function (NFR6), separate from spawning, and testable without PM2.
  *
  * Usage:
  *   node scripts/launch-stack.js [--fe_port N] [--be_port N] \
  *     [--ingress_port N] [--fe_bind A] [--be_bind A] [--ingress_bind A] \
- *     [--background] [--production] [--dry-run] [--stop]
+ *     [--workspace_dir PATH] [--background] [--production] [--dry-run] [--stop]
+ *
+ * --workspace_dir: base directory for all agent-server data (conversations,
+ *   bash events, session API key). Defaults to <repo_root>/workspace.
+ *   Can also be set via WORKSPACE_DIR env var. The session API key is
+ *   persisted at <workspace_dir>/dev-local-api-key.
  *
  * --stop: stop and delete the background stack for this checkout. Respects
  *   --production: `--stop` alone stops dev-<id>; `--production --stop` stops
  *   prod-<id>. Reads .dev-id and deletes only the matching namespace from the
- *   shared PM2 daemon. Idempotent; ignoring all other flags.
+ *   shared PM2 daemon. Idempotent; ignores all other flags.
  */
 
 "use strict";
@@ -89,6 +88,7 @@ function parseCli(argv) {
       fe_bind: { type: "string" },
       be_bind: { type: "string" },
       ingress_bind: { type: "string" },
+      workspace_dir: { type: "string" },
       background: { type: "boolean", default: false },
       production: { type: "boolean", default: false },
       "dry-run": { type: "boolean", default: false },
@@ -122,21 +122,17 @@ function readDevId(devIdFile) {
 }
 
 /**
- * Resolve the session API key by the exact chain the old ecosystem used
- * (MOVED here unchanged — FR8b). Precedence:
+ * Resolve the session API key. Precedence:
  *   (1) LOCAL_BACKEND_API_KEY env var;
- *   (2) the persisted key at OH_SESSION_API_KEY_PATH (default
- *       ~/.openhands/OpenHands/dev-local-api-key); if missing/empty,
+ *   (2) the persisted key at <workspace_dir>/dev-local-api-key; if missing/empty,
  *   (3) generate a fresh 256-bit (64-hex-char) key with the CSPRNG and
- *       persist it mode 0600 under that home path (never committed).
+ *       persist it mode 0600 under that workspace path (never committed).
  */
-function resolveSessionApiKey() {
+function resolveSessionApiKey(workspaceDir) {
   const fromEnv = (process.env.LOCAL_BACKEND_API_KEY || "").trim();
   if (fromEnv) return fromEnv;
 
-  const persistedKeyPath =
-    process.env.OH_SESSION_API_KEY_PATH ||
-    path.join(os.homedir(), ".openhands", "OpenHands", "dev-local-api-key");
+  const persistedKeyPath = path.join(workspaceDir, "dev-local-api-key");
 
   try {
     const persisted = fs.readFileSync(persistedKeyPath, "utf8").trim();
@@ -216,7 +212,8 @@ function productionPreflight(isProduction) {
  *   feBind:string,beBind:string,ingressBind:string,
  *   tag:string,namespace:string,sessionApiKey:string,
  *   nodeEnv:string,isProduction:boolean,background:boolean,dryRun:boolean,
- *   pm2Home:(string|undefined)}}
+ *   pm2Home:(string|undefined),workspaceDir:string,conversationsDir:string,
+ *   bashEventsDir:string,conversationWorkingDir:string}}
  */
 function resolve(values) {
   const isProduction = values.production === true;
@@ -236,11 +233,41 @@ function resolve(values) {
   const ingressBind = resolveBind("ingress", values.ingress_bind);
 
   productionPreflight(isProduction);
-  const sessionApiKey = resolveSessionApiKey();
 
-  // Foreground (default) uses a throwaway PM2_HOME keyed on the tag so the
-  // foreground run never touches the shared ~/.pm2 daemon. Background uses
-  // the shared daemon and sets no PM2_HOME. (FR13.)
+  // Resolve workspace directory: flag -> env var -> default (repo_root/workspace)
+  const workspaceDirFlag = values.workspace_dir;
+  let workspaceDir;
+  let conversationsDir;
+  let bashEventsDir;
+  if (workspaceDirFlag !== undefined) {
+    if (workspaceDirFlag === "") {
+      throw new Error("Workspace directory cannot be empty");
+    }
+    workspaceDir = path.resolve(workspaceDirFlag);
+  } else {
+    const fromEnv = process.env.WORKSPACE_DIR;
+    if (fromEnv && fromEnv.trim()) {
+      workspaceDir = path.resolve(fromEnv.trim());
+    } else {
+      workspaceDir = path.join(REPO_ROOT, "workspace");
+    }
+  }
+  conversationsDir = path.join(workspaceDir, 'conversations');
+  bashEventsDir = path.join(workspaceDir, 'bash_events');
+
+  // Resolve session API key using the workspace directory for persistence
+  const sessionApiKey = resolveSessionApiKey(workspaceDir);
+
+  // Per-conversation working dir base for conversations started without an
+  // explicit workspace. The frontend reads it via import.meta.env.VITE_WORKING_DIR.
+  // Defaults to "workspace/project" relative to agent-server home dir.
+  // DEV honors this at serve time (Vite exposes VITE_* to import.meta.env).
+  // PROD bakes it at build time — the served bundle must be rebuilt with the
+  // env set (e.g., via `just setup --production`).
+  const conversationWorkingDir = path.join(workspaceDir, 'project');
+
+  // Foreground uses a throwaway PM2_HOME keyed on the tag so it never touches
+  // the shared ~/.pm2 daemon. Background uses the shared daemon.
   const pm2Home = background ? undefined : `/tmp/pm2-fg-${tag}`;
 
   return {
@@ -258,6 +285,10 @@ function resolve(values) {
     background,
     dryRun,
     pm2Home,
+    workspaceDir,
+    conversationsDir,
+    bashEventsDir,
+    conversationWorkingDir,
   };
 }
 
@@ -276,6 +307,10 @@ function buildStackEnv(r) {
     STACK_INGRESS_BIND: r.ingressBind,
     STACK_TAG: r.tag,
     STACK_SESSION_API_KEY: r.sessionApiKey,
+    STACK_WORKSPACE_DIR: r.workspaceDir,
+    STACK_CONVERSATIONS_DIR: r.conversationsDir,
+    STACK_BASH_EVENTS_DIR: r.bashEventsDir,
+    STACK_VITE_WORKING_DIR: r.conversationWorkingDir,
     NODE_ENV: r.nodeEnv,
   };
 }
@@ -384,7 +419,7 @@ function main() {
     console.error(
       `Usage: node scripts/launch-stack.js [--fe_port N] [--be_port N] ` +
         `[--ingress_port N] [--fe_bind A] [--be_bind A] [--ingress_bind A] ` +
-        `[--background] [--production] [--dry-run] [--stop]`,
+        `[--workspace_dir PATH] [--background] [--production] [--dry-run] [--stop]`,
     );
     process.exit(2);
   }

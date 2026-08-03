@@ -25,3 +25,8 @@
 # .gitignore already excludes build/; this is a belt-and-braces workspace guard
 # so the prod build artifact is never committed. (docs/prd/1_local-dev-launcher.md)
 /packages/OpenHands/build/
+
+# Workspace directory for agent-server data (conversations, bash events, etc.).
+# Defaults to <repo_root>/workspace but can be overridden via --workspace_dir or WORKSPACE_DIR.
+# Ignore to avoid committing generated session data.
+/workspace/
