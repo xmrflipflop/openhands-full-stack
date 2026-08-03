@@ -51,12 +51,9 @@ setup production="false" workspace_dir="":
     ./scripts/alloc-dev-id.sh
     cd packages/software-agent-sdk && uv sync
     cd packages/OpenHands && npm install
-    if [ "{{production}}" = "true" ]; then \
-        echo "→ --production: skipping frontend build (use 'just serve --production' which builds automatically)"; \
-    else \
-        echo "→ dev mode: ensuring upstream git remotes (just setup-remotes, idempotent, no network)"; \
+    if [ "{{production}}" = "false" ]; then \
+        echo "→ dev mode: ensuring upstream git remotes"; \
         just setup-remotes; \
-        echo "→ skipping production frontend build (dev mode; pass --production to build it)"; \
     fi
 
 # Run lint and test
