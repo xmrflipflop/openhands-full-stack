@@ -40,10 +40,11 @@ setup production="false" workspace_dir="":
 # If unset, does nothing. See docs/prd/7_conversation-worktree-setup.md.
 setup-conversation-worktree:
     if [ -n "${OH_CONVERSATION_WORKTREE_ROOT:-}" ]; then \
-        echo "→ Setting up conversation worktree at ${OH_CONVERSATION_WORKTREE_ROOT}"; \
-        mkdir -p "${OH_CONVERSATION_WORKTREE_ROOT}"; \
+        eval "expanded_root=${OH_CONVERSATION_WORKTREE_ROOT}"; \
+        echo "→ Setting up conversation worktree at $expanded_root"; \
+        mkdir -p "$expanded_root"; \
         rm -rf /tmp/conversation-worktrees; \
-        ln -s "${OH_CONVERSATION_WORKTREE_ROOT}" /tmp/conversation-worktrees; \
+        ln -s "$expanded_root" /tmp/conversation-worktrees; \
     else \
         echo "→ OH_CONVERSATION_WORKTREE_ROOT not set; skipping conversation worktree setup"; \
     fi
