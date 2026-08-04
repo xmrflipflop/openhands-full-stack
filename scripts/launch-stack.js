@@ -191,15 +191,15 @@ function resolveBind(service, flagValue) {
   return LOOPBACK;
 }
 
-function productionPreflight(isProduction) {
+function productionPreflight(isProduction, viteWorkingDir) {
   if (!isProduction) return;
   
   // Check if build is valid or needs rebuild
-  const buildCheck = checkBuildCache();
+  const buildCheck = checkBuildCache(viteWorkingDir);
   if (!buildCheck.valid) {
     console.log(`[run-stack] ${buildCheck.reason}`);
     console.log(`[run-stack] Building production frontend...`);
-    runBuild();
+    runBuild(viteWorkingDir);
   }
   
   if (!fs.existsSync(CANVAS_BUILD_INDEX)) {
@@ -220,7 +220,7 @@ function productionPreflight(isProduction) {
  * - VITE_WORKING_DIR has changed since last build
  * - Build command has changed
  */
-function checkBuildCache() {
+function checkBuildCache(viteWorkingDir) {
   if (!fs.existsSync(BUILD_CACHE_FILE)) {
     return { valid: false, reason: "No build cache found. First production run." };
   }
@@ -257,9 +257,8 @@ function checkBuildCache() {
   }
 
   // Check if VITE_WORKING_DIR has changed
-  const currentViteWorkingDir = process.env.VITE_WORKING_DIR || path.join(REPO_ROOT, "workspace", "project");
-  if (cache.viteWorkingDir !== currentViteWorkingDir) {
-    return { valid: false, reason: `VITE_WORKING_DIR changed (${cache.viteWorkingDir} -> ${currentViteWorkingDir}). Rebuilding.` };
+  if (cache.viteWorkingDir !== viteWorkingDir) {
+    return { valid: false, reason: `VITE_WORKING_DIR changed (${cache.viteWorkingDir} -> ${viteWorkingDir}). Rebuilding.` };
   }
 
   // Check if build command has changed
@@ -273,8 +272,7 @@ function checkBuildCache() {
 /**
  * Run the production build with the correct VITE_WORKING_DIR.
  */
-function runBuild() {
-  const viteWorkingDir = process.env.VITE_WORKING_DIR || path.join(REPO_ROOT, "workspace", "project");
+function runBuild(viteWorkingDir) {
   
   // Delete old build directory if it exists
   if (fs.existsSync(CANVAS_BUILD_DIR)) {
@@ -361,8 +359,6 @@ function resolve(values) {
   const beBind = resolveBind("be", values.be_bind);
   const ingressBind = resolveBind("ingress", values.ingress_bind);
 
-  productionPreflight(isProduction);
-
   // Resolve workspace directory: flag -> env var -> default (repo_root/workspace)
   const workspaceDirFlag = values.workspace_dir;
   let workspaceDir;
@@ -398,6 +394,8 @@ function resolve(values) {
   // Foreground uses a throwaway PM2_HOME keyed on the tag so it never touches
   // the shared ~/.pm2 daemon. Background uses the shared daemon.
   const pm2Home = background ? undefined : `/tmp/pm2-fg-${tag}`;
+
+  productionPreflight(isProduction, conversationWorkingDir);
 
   return {
     fePort,
