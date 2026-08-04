@@ -579,6 +579,10 @@ function main() {
 
   console.error(describeLaunch(r));
   spawnPm2(r);
+
+  if (r.background) {
+    console.log(`logs are available via pm2 logs ${r.tag}`);
+  }
 }
 
 module.exports = {
