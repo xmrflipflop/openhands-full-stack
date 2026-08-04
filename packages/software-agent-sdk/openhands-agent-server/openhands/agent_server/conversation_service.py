@@ -74,8 +74,6 @@ if TYPE_CHECKING:
     from openhands.sdk.mcp.config import MCPServer
     from openhands.sdk.subagent.schema import AgentDefinition
 
-CONVERSATION_WORKTREE_ROOT = Path("/tmp/conversation-worktrees")
-
 
 def _build_worktree_guidance(
     *,
@@ -186,6 +184,7 @@ def _get_worktree_start_point(repo_root: Path) -> str:
 def _create_conversation_worktree(
     workspace: LocalWorkspace,
     conversation_id: UUID,
+    conversation_worktree_root: Path,
 ) -> tuple[LocalWorkspace, Path, Path, str] | None:
     source_workspace = Path(workspace.working_dir).resolve()
     try:
@@ -200,9 +199,9 @@ def _create_conversation_worktree(
         return None
 
     relative_workspace = source_workspace.relative_to(repo_root)
-    conversation_worktree_root = CONVERSATION_WORKTREE_ROOT / str(conversation_id)
-    worktree_root = conversation_worktree_root / repo_root.name
-    conversation_worktree_root.mkdir(parents=True, exist_ok=True)
+    conversation_worktree_dir = conversation_worktree_root / str(conversation_id)
+    worktree_root = conversation_worktree_dir / repo_root.name
+    conversation_worktree_dir.mkdir(parents=True, exist_ok=True)
     branch = f"openhands/{conversation_id}"
 
     if worktree_root.exists():
@@ -245,11 +244,14 @@ def _create_conversation_worktree(
 def _prepare_request_workspace(
     request: StartConversationRequest,
     conversation_id: UUID,
+    conversation_worktree_root: Path,
 ) -> StartConversationRequest:
     if not request.worktree:
         return request
 
-    worktree = _create_conversation_worktree(request.workspace, conversation_id)
+    worktree = _create_conversation_worktree(
+        request.workspace, conversation_id, conversation_worktree_root
+    )
     if worktree is None:
         return request
 
@@ -519,6 +521,7 @@ class ConversationService:
     owner_instance_id: str = field(default_factory=lambda: uuid4().hex)
     max_concurrent_runs: int = 10
     lease_ttl_seconds: float = DEFAULT_LEASE_TTL_SECONDS
+    conversation_worktree_root: Path = field(default=Path("/tmp/conversation-worktrees"))
     _event_services: dict[UUID, EventService] | None = field(default=None, init=False)
     _conversation_records: dict[UUID, _ConversationRecord] = field(
         default_factory=dict, init=False
@@ -1100,7 +1103,9 @@ class ConversationService:
                 update={"agent": _append_system_message_suffix(request.agent, suffix)}
             )
 
-        request = _prepare_request_workspace(request, conversation_id)
+        request = _prepare_request_workspace(
+            request, conversation_id, self.conversation_worktree_root
+        )
 
         managed_codex_credential = self._is_codex_agent(request.agent) and (
             CODEX_AUTH_SECRET_NAME in self._credential_bindings.get(conversation_id, {})
@@ -1670,6 +1675,7 @@ class ConversationService:
             secrets_store=get_secrets_store(config),
             max_concurrent_runs=config.max_concurrent_runs,
             lease_ttl_seconds=config.lease_ttl_seconds,
+            conversation_worktree_root=config.conversation_worktree_root,
         )
 
     async def _start_event_service(
