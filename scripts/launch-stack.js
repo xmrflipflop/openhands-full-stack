@@ -581,7 +581,8 @@ function main() {
   spawnPm2(r);
 
   if (r.background) {
-    console.log(`logs are available via pm2 logs ${r.tag}`);
+    console.log(`\n  ✓ Stack started in background (namespace: ${r.tag})`);
+    console.log(`    View logs: pm2 logs ${r.tag}\n`);
   }
 }
 
