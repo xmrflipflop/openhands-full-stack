@@ -28,9 +28,24 @@ setup production="false" workspace_dir="":
     ./scripts/alloc-dev-id.sh
     cd packages/software-agent-sdk && uv sync
     cd packages/OpenHands && npm install
+    just setup-conversation-worktree
     if [ "{{production}}" = "false" ]; then \
         echo "→ dev mode: ensuring upstream git remotes"; \
         just setup-remotes; \
+    fi
+
+# Set up conversation worktree symlink at /tmp/conversation-worktrees.
+# Reads OH_CONVERSATION_WORKTREE_ROOT env var; if set, creates the target
+# directory and symlinks it to /tmp/conversation-worktrees.
+# If unset, does nothing. See docs/prd/7_conversation-worktree-setup.md.
+setup-conversation-worktree:
+    if [ -n "${OH_CONVERSATION_WORKTREE_ROOT:-}" ]; then \
+        echo "→ Setting up conversation worktree at ${OH_CONVERSATION_WORKTREE_ROOT}"; \
+        mkdir -p "${OH_CONVERSATION_WORKTREE_ROOT}"; \
+        rm -rf /tmp/conversation-worktrees; \
+        ln -s "${OH_CONVERSATION_WORKTREE_ROOT}" /tmp/conversation-worktrees; \
+    else \
+        echo "→ OH_CONVERSATION_WORKTREE_ROOT not set; skipping conversation worktree setup"; \
     fi
 
 # Run lint and test
