@@ -579,6 +579,11 @@ function main() {
 
   console.error(describeLaunch(r));
   spawnPm2(r);
+
+  if (r.background) {
+    console.log(`\n  ✓ Stack started in background (namespace: ${r.tag})`);
+    console.log(`    View logs: pm2 logs ${r.tag}\n`);
+  }
 }
 
 module.exports = {
