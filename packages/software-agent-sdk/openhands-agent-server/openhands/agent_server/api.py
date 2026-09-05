@@ -5,6 +5,7 @@ import traceback
 import uuid
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager, suppress
+from importlib.metadata import version
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -20,12 +21,14 @@ from openhands.agent_server.agent_profiles_router import agent_profiles_router
 from openhands.agent_server.auth_router import auth_router
 from openhands.agent_server.bash_router import bash_router
 from openhands.agent_server.bash_service import get_default_bash_event_service
+from openhands.agent_server.canvas_extensions_router import canvas_extensions_router
 from openhands.agent_server.config import (
     Config,
     get_default_config,
 )
 from openhands.agent_server.conversation_router import conversation_router
 from openhands.agent_server.conversation_service import (
+    CredentialBindingActivationRequired,
     get_default_conversation_service,
 )
 from openhands.agent_server.credential_binding import (
@@ -55,6 +58,9 @@ from openhands.agent_server.openai.router import (
 )
 from openhands.agent_server.plugins_router import plugins_router
 from openhands.agent_server.profiles_router import profiles_router
+from openhands.agent_server.provider_connections_router import (
+    provider_connections_router,
+)
 from openhands.agent_server.server_details_router import (
     get_server_info,
     mark_initialization_complete,
@@ -369,6 +375,7 @@ def _create_fastapi_instance(config: Config) -> FastAPI:
     """
     return FastAPI(
         title="OpenHands Agent Server",
+        version=version("openhands-agent-server"),
         description=(
             "OpenHands Agent Server - REST/WebSocket interface for OpenHands AI Agent"
         ),
@@ -435,8 +442,10 @@ def _add_api_routes(app: FastAPI) -> None:
     api_router.include_router(skills_router)
     api_router.include_router(sub_agents_router)
     api_router.include_router(plugins_router)
+    api_router.include_router(canvas_extensions_router)
     api_router.include_router(hooks_router)
     api_router.include_router(llm_router)
+    api_router.include_router(provider_connections_router)
     api_router.include_router(mcp_router)
     api_router.include_router(settings_router)
     api_router.include_router(workspaces_router)
@@ -530,6 +539,19 @@ def _sanitize_validation_errors(errors: Sequence[Any]) -> list[dict]:
 
 def _add_exception_handlers(api: FastAPI) -> None:
     """Add exception handlers to the FastAPI application."""
+
+    @api.exception_handler(CredentialBindingActivationRequired)
+    async def _credential_binding_activation_required_handler(
+        _request: Request,
+        exc: CredentialBindingActivationRequired,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": str(exc),
+                "retryable": True,
+            },
+        )
 
     @api.exception_handler(RequestValidationError)
     async def _validation_exception_handler(

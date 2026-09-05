@@ -2,7 +2,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, ClassVar, Literal
+from typing import Any, ClassVar, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
@@ -14,6 +14,7 @@ from openhands.agent_server.env_parser import (
     get_env_parser,
     merge,
 )
+from openhands.agent_server.telemetry_types import DeploymentKind
 from openhands.sdk.marketplace.registration import MarketplaceRegistration
 from openhands.sdk.utils.cipher import Cipher
 
@@ -24,6 +25,9 @@ V1_SESSION_API_KEY_ENV = "OH_SESSION_API_KEYS_0"
 ENVIRONMENT_VARIABLE_PREFIX = "OH"
 CONFIG_PATH_ENV = "OPENHANDS_AGENT_SERVER_CONFIG_PATH"
 DEFAULT_CONFIG_PATH = Path("workspace/openhands_agent_server_config.json")
+# 20 minutes, matching the idle timeout used by OpenHands Cloud.
+DEFAULT_CONVERSATION_IDLE_TTL_SECONDS: Final[float] = 20 * 60.0
+ACPSkillSourcing = Literal["native", "openhands_managed"]
 _logger = logging.getLogger(__name__)
 
 
@@ -104,9 +108,24 @@ class WebhookSpec(BaseModel):
         default=1000,
         ge=1,
         description=(
-            "Upper bound on the number of events buffered for delivery. When the "
-            "downstream is failing and events are re-queued for retry, the oldest "
+            "Upper bound on the number of events buffered for delivery. The oldest "
             "events are dropped past this bound to prevent unbounded memory growth."
+        ),
+    )
+    max_batch_bytes: int = Field(
+        default=5 * 1024 * 1024,
+        ge=1,
+        description=(
+            "Upper bound on the serialized size of each webhook request. A single "
+            "event larger than this limit is sent by itself."
+        ),
+    )
+    max_queue_bytes: int = Field(
+        default=50 * 1024 * 1024,
+        ge=1,
+        description=(
+            "Upper bound on the serialized size of events buffered for delivery. "
+            "The oldest events are dropped when the queue exceeds this bound."
         ),
     )
 
@@ -118,13 +137,19 @@ TelemetryExporterKind = Literal["none", "posthog", "http"]
 class TelemetrySpec(BaseModel):
     """Deployment-supplied product-analytics transport settings.
 
-    This carries *transport* only. Whether telemetry may be delivered is
-    resolved from consent (``misc_settings.telemetry.consent``, optionally
-    seeded or overridden by ``OH_TELEMETRY_CONSENT``) — there is no deployment
-    "mode" here, and nothing in the agent-server special-cases a hosted
-    deployment.
+    This carries transport plus the non-identifying deployment tag. Whether
+    telemetry may be delivered is resolved from consent
+    (``misc_settings.telemetry.consent``, optionally seeded or overridden by
+    ``OH_TELEMETRY_CONSENT``).
     """
 
+    deployment_kind: DeploymentKind = Field(
+        default="local",
+        description=(
+            "Deployment kind attached to diagnostic events. Use 'remote' for "
+            "hosted OpenHands and 'local' for self-hosted or developer runs."
+        ),
+    )
     exporter: TelemetryExporterKind = Field(
         default="none",
         description=(
@@ -237,6 +262,14 @@ class Config(BaseModel):
             "Default workspace directory for conversations created by the server."
         ),
     )
+    conversation_worktree_root: Path = Field(
+        default=Path("/tmp/conversation-worktrees"),
+        description=(
+            "Root directory for conversation git worktrees. Each conversation gets a "
+            "subdirectory under this root when using git-backed workspaces with "
+            "worktree=True."
+        ),
+    )
     bash_events_dir: Path = Field(
         default=Path("workspace/bash_events"),
         description=(
@@ -317,6 +350,20 @@ class Config(BaseModel):
             "The URL where this agent server instance is available externally"
         ),
     )
+    acp_skill_sourcing: ACPSkillSourcing = Field(
+        default="native",
+        description=(
+            "Who supplies an ACP agent's skills. 'native' (the default, for a "
+            "host-local agent-server): nobody but the ACP CLI — it reads the "
+            "user's own home configuration and the repository, so OpenHands "
+            "injects none of its managed skills. 'openhands_managed' (for "
+            "container runtimes, where that host configuration is absent): also "
+            "inject the user/org/public/marketplace skills the server "
+            "discovers. Project/repository skills are never injected either way "
+            "— the CLI reads AGENTS.md itself (#4019). Set explicitly per "
+            "deployment; the agent-server image sets 'openhands_managed'."
+        ),
+    )
     registered_marketplaces: list[MarketplaceRegistration] = Field(
         default_factory=list,
         description=(
@@ -347,6 +394,18 @@ class Config(BaseModel):
             "ownership is impossible. Values between 0 and "
             "LEASE_RENEW_INTERVAL_SECONDS (15 s) are valid but cause the lease "
             "to expire before the first renewal, effectively making it one-shot."
+        ),
+    )
+    conversation_idle_ttl_seconds: float | None = Field(
+        default=DEFAULT_CONVERSATION_IDLE_TTL_SECONDS,
+        gt=0,
+        description=(
+            "Seconds an idle conversation stays in memory before a background "
+            "task evicts it; evicted conversations re-hydrate from disk on next "
+            "access. Defaults to 20 minutes. Conversations that are running, "
+            "have a pending rerun, or have an attached websocket subscriber are "
+            "never evicted. Set to null to keep conversations in memory until "
+            "they are deleted or the server restarts."
         ),
     )
     telemetry: TelemetrySpec = Field(
