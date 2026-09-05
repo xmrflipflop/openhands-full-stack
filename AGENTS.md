@@ -247,6 +247,21 @@ git subtree pull \
   software-agent-sdk main
 ```
 
+The two subtrees were imported differently, so they sync differently:
+
+- **`software-agent-sdk`** carries real shared ancestry with its upstream (its sync commit is a genuine 2-parent merge), so `git subtree merge`/`pull` works normally.
+- **`OpenHands`** was brought in via a **squash import** (a single-parent PR merge), so it has *no shared git ancestry* with the OpenHands monorepo. `git subtree merge`/`pull` against it fails with `fatal: refusing to merge unrelated histories`. Do not treat that as a real conflict. Instead sync it by materialising the release tree into the prefix and committing one squashed sync:
+
+  ```bash
+  git fetch --no-tags OpenHands "refs/tags/<ref>:refs/tags/upstream-oh"
+  rm -rf packages/OpenHands && mkdir -p packages/OpenHands
+  git archive upstream-oh | tar -x -C packages/OpenHands/
+  # re-apply any workspace-owned lines that the archive would drop
+  git add packages/OpenHands && git commit -m "chore: sync OpenHands to <ref>"
+  ```
+
+  Keep any workspace-owned lines that live inside the package (for example the `.build-cache.json` entry in the package's `.gitignore`, used by the production build cache) re-applied on top of the archived tree, then verify the result is byte-identical to the upstream tag apart from those intentional lines. Reconcile any `git subtree`-style "unrelated histories" error the same way on a future sync.
+
 After updating a subtree:
 
 1. Inspect the complete diff and resolve merge conflicts carefully.
