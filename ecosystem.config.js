@@ -20,8 +20,8 @@
  *   STACK_VITE_WORKING_DIR
  *   NODE_ENV is optional and defaults to "development".
  *   OH_CONVERSATION_WORKTREE_ROOT is optional: the operator's env var, forwarded
- *   to the backend as-is when set so per-conversation worktrees leave the
- *   agent-server's built-in /tmp default.
+ *   to the backend when set (a leading ~ is expanded to the home dir) so
+ *   per-conversation worktrees leave the agent-server's built-in /tmp default.
  *
  * Three cooperating services, all launched strictly from THIS repository:
  *
@@ -65,6 +65,7 @@
 
 const fs = require("node:fs");
 const path = require("node:path");
+const os = require("node:os");
 
 const repoRoot = __dirname;
 const SDK_DIR = path.join(repoRoot, "packages", "software-agent-sdk");
@@ -103,9 +104,14 @@ const workspaceDir = requireStackVar("STACK_WORKSPACE_DIR");
 const conversationsDir = requireStackVar("STACK_CONVERSATIONS_DIR");
 const bashEventsDir = requireStackVar("STACK_BASH_EVENTS_DIR");
 // Root dir for per-conversation git worktrees. The operator's OH_CONVERSATION_WORKTREE_ROOT
-// env var, forwarded to the backend as-is when set; the agent-server keeps its
-// built-in default, /tmp/conversation-worktrees, when it is unset.
-const conversationWorktreeRoot = process.env.OH_CONVERSATION_WORKTREE_ROOT || undefined;
+// env var, forwarded to the backend when set; the agent-server keeps its
+// built-in default, /tmp/conversation-worktrees, when it is unset. A leading ~ is
+// expanded to the home directory before forwarding — the agent-server reads the
+// value verbatim and would otherwise create a literal "~" directory.
+const worktreeEnv = process.env.OH_CONVERSATION_WORKTREE_ROOT;
+const conversationWorktreeRoot = worktreeEnv && worktreeEnv.trim()
+  ? (worktreeEnv.startsWith("~") ? path.join(os.homedir(), worktreeEnv.slice(1)) : worktreeEnv)
+  : undefined;
 // Per-conversation working dir base for conversations without explicit workspace.
 // Frontend reads via import.meta.env.VITE_WORKING_DIR.
 // DEV honors at serve time (Vite exposes VITE_* to import.meta.env).
