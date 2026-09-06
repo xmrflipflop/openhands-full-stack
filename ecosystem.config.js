@@ -19,8 +19,9 @@
  *   STACK_WORKSPACE_DIR, STACK_CONVERSATIONS_DIR, STACK_BASH_EVENTS_DIR,
  *   STACK_VITE_WORKING_DIR
  *   NODE_ENV is optional and defaults to "development".
- *   OH_CONVERSATION_WORKTREE_ROOT is optional: the operator's env var, forwarded
- *   to the backend when set (a leading ~ is expanded to the home dir) so
+ *   OH_CONVERSATION_WORKTREE_ROOT is optional: the operator's env var, parsed into
+ *   an absolute directory (a leading ~ is home-relative; other paths resolve
+ *   against the checkout) and forwarded to the backend when set, so
  *   per-conversation worktrees leave the agent-server's built-in /tmp default.
  *
  * Three cooperating services, all launched strictly from THIS repository:
@@ -103,15 +104,23 @@ const apiKey = requireStackVar("STACK_SESSION_API_KEY");
 const workspaceDir = requireStackVar("STACK_WORKSPACE_DIR");
 const conversationsDir = requireStackVar("STACK_CONVERSATIONS_DIR");
 const bashEventsDir = requireStackVar("STACK_BASH_EVENTS_DIR");
-// Root dir for per-conversation git worktrees. The operator's OH_CONVERSATION_WORKTREE_ROOT
-// env var, forwarded to the backend when set; the agent-server keeps its
-// built-in default, /tmp/conversation-worktrees, when it is unset. A leading ~ is
-// expanded to the home directory before forwarding — the agent-server reads the
-// value verbatim and would otherwise create a literal "~" directory.
-const worktreeEnv = process.env.OH_CONVERSATION_WORKTREE_ROOT;
-const conversationWorktreeRoot = worktreeEnv && worktreeEnv.trim()
-  ? (worktreeEnv.startsWith("~") ? path.join(os.homedir(), worktreeEnv.slice(1)) : worktreeEnv)
-  : undefined;
+// Root dir for per-conversation git worktrees. Parses the operator's
+// OH_CONVERSATION_WORKTREE_ROOT into an absolute directory: a value with a
+// leading ~ is home-relative (the agent-server reads the value verbatim and
+// would otherwise create a literal "~" directory); any other path is resolved
+// against the checkout. When unset/empty the backend keeps its built-in
+// default, /tmp/conversation-worktrees.
+function resolveConversationWorktreeRoot(raw) {
+  const value = raw && raw.trim();
+  if (!value) return undefined;
+  if (value.startsWith("~")) {
+    return path.join(os.homedir(), value.slice(1).replace(/^\//, ""));
+  }
+  return path.resolve(value);
+}
+const conversationWorktreeRoot = resolveConversationWorktreeRoot(
+  process.env.OH_CONVERSATION_WORKTREE_ROOT,
+);
 // Per-conversation working dir base for conversations without explicit workspace.
 // Frontend reads via import.meta.env.VITE_WORKING_DIR.
 // DEV honors at serve time (Vite exposes VITE_* to import.meta.env).
