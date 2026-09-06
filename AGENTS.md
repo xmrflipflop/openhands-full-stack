@@ -261,6 +261,10 @@ Example:
 chore: update OpenHands subtree
 ```
 
+### Merging the sync into `main`
+
+When a subtree sync is merged into `main` through a pull request, merge it with **"Create a merge commit"** — not "Squash and merge". `git subtree merge` produces a two-parent merge commit whose second parent is the exact upstream commit the subtree was synced to. Keeping that commit intact on `main` preserves the pointer to the upstream state, so the workspace history stays comparable against upstream commit history (which release/tag was pulled, and diffs against that commit). "Squash and merge" rewrites the sync into a single synthetic commit with a new SHA and drops the merge parents, which breaks the correspondence with upstream history.
+
 ## Fork workflow
 
 If changes within a subtree should be submitted upstream, use a personal fork rather than pushing to a canonical OpenHands remote.
