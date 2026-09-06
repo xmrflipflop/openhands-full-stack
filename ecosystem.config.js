@@ -17,9 +17,11 @@
  *   STACK_FE_BIND,  STACK_BE_BIND,  STACK_INGRESS_BIND,
  *   STACK_TAG,      STACK_SESSION_API_KEY,
  *   STACK_WORKSPACE_DIR, STACK_CONVERSATIONS_DIR, STACK_BASH_EVENTS_DIR,
- *   STACK_CONVERSATION_WORKTREE_ROOT,
  *   STACK_VITE_WORKING_DIR
  *   NODE_ENV is optional and defaults to "development".
+ *   OH_CONVERSATION_WORKTREE_ROOT is optional: the operator's env var, forwarded
+ *   to the backend as-is when set so per-conversation worktrees leave the
+ *   agent-server's built-in /tmp default.
  *
  * Three cooperating services, all launched strictly from THIS repository:
  *
@@ -100,10 +102,10 @@ const apiKey = requireStackVar("STACK_SESSION_API_KEY");
 const workspaceDir = requireStackVar("STACK_WORKSPACE_DIR");
 const conversationsDir = requireStackVar("STACK_CONVERSATIONS_DIR");
 const bashEventsDir = requireStackVar("STACK_BASH_EVENTS_DIR");
-// Root dir for per-conversation git worktrees. Fan out to the backend as
-// OH_CONVERSATION_WORKTREE_ROOT so the agent-server writes worktrees here
-// instead of its built-in default, /tmp/conversation-worktrees.
-const conversationWorktreeRoot = requireStackVar("STACK_CONVERSATION_WORKTREE_ROOT");
+// Root dir for per-conversation git worktrees. The operator's OH_CONVERSATION_WORKTREE_ROOT
+// env var, forwarded to the backend as-is when set; the agent-server keeps its
+// built-in default, /tmp/conversation-worktrees, when it is unset.
+const conversationWorktreeRoot = process.env.OH_CONVERSATION_WORKTREE_ROOT || undefined;
 // Per-conversation working dir base for conversations without explicit workspace.
 // Frontend reads via import.meta.env.VITE_WORKING_DIR.
 // DEV honors at serve time (Vite exposes VITE_* to import.meta.env).
@@ -229,7 +231,7 @@ const apps = [
     env: {
       ...sharedEnv,
       OH_SESSION_API_KEYS_0: apiKey,
-      OH_CONVERSATION_WORKTREE_ROOT: conversationWorktreeRoot,
+      ...(conversationWorktreeRoot && { OH_CONVERSATION_WORKTREE_ROOT: conversationWorktreeRoot }),
       PYTHONUNBUFFERED: "1",
     },
     ...supervise,
