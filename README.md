@@ -219,3 +219,5 @@ git add packages/OpenHands packages/software-agent-sdk
 git commit -m "chore: update OpenHands subtrees"
 git push origin main
 ```
+
+If you merge the sync through a pull request rather than pushing straight to `main`, use **"Create a merge commit"** in the PR — not "Squash and merge". The subtree sync commit is a two-parent merge whose second parent is the exact upstream commit you synced to; keeping it as a real merge on `main` preserves that link so the workspace history stays comparable against upstream commit history. "Squash and merge" rewrites it into a single new commit and drops that provenance.
