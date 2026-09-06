@@ -7,7 +7,9 @@
 # Checks, in both directions:
 #   1. doc -> code: every repository path referenced in a docs/prd/*.md file
 #      (backtick-quoted, slash-containing tokens) exists. Retired PRDs are
-#      skipped.
+#      skipped. Paths that git ignores (generated / machine-local artifacts)
+#      are exempt: they are intentionally not committed, so their absence is
+#      not drift.
 #   2. code -> doc: every docs/prd/<slug>.md referenced from a non-doc file
 #      exists.
 #   3. every WORKSPACE-PATCH marker names its owning PRD on the same line.
@@ -49,6 +51,10 @@ if [ -d "$PRD_DIR" ]; then
       | grep -E '^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)+/?$' | sort -u)"
 
     for path in $candidates; do
+      # Generated / machine-local artifacts (gitignored) are not committed,
+      # so their absence is not drift. check-ignore -q exits 0 when the path
+      # matches a gitignore pattern, even if the path does not exist.
+      git -C "$REPO_ROOT" check-ignore -q "$path" 2>/dev/null && continue
       [ -e "$REPO_ROOT/$path" ] \
         || note_fail "$rel_prd references missing path: $path"
     done
