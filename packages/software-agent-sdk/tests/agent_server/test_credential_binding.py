@@ -1,14 +1,22 @@
 import json
-from unittest.mock import AsyncMock, patch
+import threading
+from collections.abc import Generator
+from dataclasses import dataclass, field
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest.mock import AsyncMock, call, patch
 from uuid import uuid4
 
+import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
 import openhands.agent_server.event_service as event_service_module
-from openhands.agent_server.conversation_service import ConversationService
+from openhands.agent_server.conversation_service import (
+    ConversationService,
+    CredentialBindingActivationRequired,
+)
 from openhands.agent_server.credential_binding import (
     LocalVersionedCredentialBinding,
     router,
@@ -32,7 +40,41 @@ from openhands.sdk.credential import (
     HttpVersionedCredentialBinding,
 )
 from openhands.sdk.secret import StaticSecret
+from openhands.sdk.utils.cipher import Cipher
 from openhands.sdk.workspace import LocalWorkspace
+
+
+@dataclass
+class _CallbackState:
+    responses: list[tuple[int, str]] = field(default_factory=list)
+    authorizations: list[str | None] = field(default_factory=list)
+
+
+@pytest.fixture
+def credential_callback() -> Generator[tuple[str, _CallbackState]]:
+    state = _CallbackState()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            state.authorizations.append(self.headers.get("Authorization"))
+            response_status, body = state.responses.pop(0)
+            self.send_response(response_status)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body.encode())
+
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}/credential", state
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
 
 
 @pytest.mark.asyncio
@@ -151,17 +193,22 @@ def test_whole_store_save_updates_credential_versions(tmp_path) -> None:
     assert recreated_version != replacement_version
 
 
-def test_activation_route_installs_http_binding(tmp_path) -> None:
+def test_activation_route_installs_http_binding(
+    tmp_path,
+    credential_callback: tuple[str, _CallbackState],
+) -> None:
     service = ConversationService(conversations_dir=tmp_path / "conversations")
     app = FastAPI()
     app.state.conversation_service = service
     app.include_router(router, prefix="/api")
     conversation_id = uuid4()
+    callback_url, callback = credential_callback
+    callback.responses.append((200, '{"value":"credential","version":"v1"}'))
 
     response = TestClient(app).put(
         f"/api/conversations/{conversation_id}/credential-bindings/CODEX_AUTH_JSON",
         json={
-            "url": "https://app.test/api/credential",
+            "url": callback_url,
             "headers": {
                 "Authorization": "Bearer scoped",
             },
@@ -169,10 +216,143 @@ def test_activation_route_installs_http_binding(tmp_path) -> None:
     )
 
     assert response.status_code == 204
+    assert callback.authorizations == ["Bearer scoped"]
     binding = service._credential_bindings[conversation_id]["CODEX_AUTH_JSON"]
     assert isinstance(binding, HttpVersionedCredentialBinding)
-    assert binding.url == "https://app.test/api/credential"
+    assert binding.url == callback_url
     assert binding.headers == {"Authorization": "Bearer scoped"}
+
+
+def test_activation_route_rejects_unavailable_binding(
+    tmp_path,
+    credential_callback: tuple[str, _CallbackState],
+) -> None:
+    service = ConversationService(conversations_dir=tmp_path / "conversations")
+    app = FastAPI()
+    app.state.conversation_service = service
+    app.include_router(router, prefix="/api")
+    conversation_id = uuid4()
+    callback_url, callback = credential_callback
+    callback.responses.extend([(503, "{}")] * 3)
+
+    sleep = AsyncMock()
+    with patch("openhands.agent_server.credential_binding.asyncio.sleep", sleep):
+        response = TestClient(app).put(
+            f"/api/conversations/{conversation_id}/credential-bindings/CODEX_AUTH_JSON",
+            json={
+                "url": callback_url,
+                "headers": {"Authorization": "Bearer scoped"},
+            },
+        )
+
+    assert response.status_code == 502
+    assert conversation_id not in service._credential_bindings
+    assert callback.authorizations == ["Bearer scoped"] * 3
+    assert sleep.await_args_list == [call(0.25), call(0.5)]
+
+
+def test_activation_route_retries_transient_binding_failure(
+    tmp_path,
+    credential_callback: tuple[str, _CallbackState],
+) -> None:
+    service = ConversationService(conversations_dir=tmp_path / "conversations")
+    app = FastAPI()
+    app.state.conversation_service = service
+    app.include_router(router, prefix="/api")
+    conversation_id = uuid4()
+    callback_url, callback = credential_callback
+    callback.responses.extend(
+        [
+            (503, "{}"),
+            (200, '{"value":"credential","version":"v1"}'),
+        ]
+    )
+    sleep = AsyncMock()
+
+    with patch("openhands.agent_server.credential_binding.asyncio.sleep", sleep):
+        response = TestClient(app).put(
+            f"/api/conversations/{conversation_id}/credential-bindings/CODEX_AUTH_JSON",
+            json={
+                "url": callback_url,
+                "headers": {"Authorization": "Bearer scoped"},
+            },
+        )
+
+    assert response.status_code == 204
+    assert callback.authorizations == ["Bearer scoped"] * 2
+    sleep.assert_awaited_once_with(0.25)
+    assert conversation_id in service._credential_bindings
+
+
+@pytest.mark.parametrize(
+    ("callback_status", "body", "activation_status"),
+    [
+        (404, "{}", 422),
+        (403, "{}", 403),
+        (409, "{}", 409),
+        (501, "{}", 501),
+        (200, "not-json", 422),
+    ],
+)
+def test_activation_route_rejects_terminal_binding_failure(
+    tmp_path,
+    credential_callback: tuple[str, _CallbackState],
+    callback_status: int,
+    body: str,
+    activation_status: int,
+) -> None:
+    service = ConversationService(conversations_dir=tmp_path / "conversations")
+    app = FastAPI()
+    app.state.conversation_service = service
+    app.include_router(router, prefix="/api")
+    conversation_id = uuid4()
+    callback_url, callback = credential_callback
+    callback.responses.append((callback_status, body))
+
+    response = TestClient(app).put(
+        f"/api/conversations/{conversation_id}/credential-bindings/CODEX_AUTH_JSON",
+        json={
+            "url": callback_url,
+            "headers": {"Authorization": "Bearer scoped"},
+        },
+    )
+
+    assert response.status_code == activation_status
+    assert callback.authorizations == ["Bearer scoped"]
+    assert conversation_id not in service._credential_bindings
+
+
+@pytest.mark.parametrize(
+    "binding_url",
+    [
+        "ftp://broker.test/credential",
+        "/relative/credential",
+        "http://example.com:abc/credential",
+    ],
+)
+def test_activation_route_rejects_invalid_binding_url(
+    tmp_path,
+    binding_url: str,
+) -> None:
+    service = ConversationService(conversations_dir=tmp_path / "conversations")
+    app = FastAPI()
+    app.state.conversation_service = service
+    app.include_router(router, prefix="/api")
+    conversation_id = uuid4()
+
+    sleep = AsyncMock()
+    with patch("openhands.agent_server.credential_binding.asyncio.sleep", sleep):
+        response = TestClient(app).put(
+            f"/api/conversations/{conversation_id}/credential-bindings/CODEX_AUTH_JSON",
+            json={
+                "url": binding_url,
+                "headers": {"Authorization": "Bearer scoped"},
+            },
+        )
+
+    assert response.status_code == 422
+    assert conversation_id not in service._credential_bindings
+    sleep.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -187,14 +367,14 @@ async def test_direct_conversations_share_rotated_canonical_value(tmp_path) -> N
     workspace = LocalWorkspace(working_dir=tmp_path / "workspace")
 
     first = await service._resolve_credential_bindings(
-        StoredConversation(id=uuid4(), agent=agent, workspace=workspace)
+        StoredConversation(id=uuid4(), workspace=workspace), agent=agent
     )
     first_binding = first["CODEX_AUTH_JSON"]
     initial = await first_binding.load()
     await first_binding.replace(initial.version, "r1")
 
     second = await service._resolve_credential_bindings(
-        StoredConversation(id=uuid4(), agent=agent, workspace=workspace)
+        StoredConversation(id=uuid4(), workspace=workspace), agent=agent
     )
     assert (await second["CODEX_AUTH_JSON"].load()).value == "r1"
 
@@ -218,6 +398,143 @@ async def test_direct_start_strips_reserved_conversation_secret(tmp_path) -> Non
         assert event_service is not None
         assert "CODEX_AUTH_JSON" not in event_service.stored.secrets
         assert "CODEX_AUTH_JSON" in event_service.credential_bindings
+        assert not event_service.stored.required_runtime_credential_bindings
+
+
+@pytest.mark.asyncio
+async def test_callback_binding_blocks_cold_hydration_until_reactivation(
+    tmp_path,
+) -> None:
+    conversation_id = uuid4()
+    request = StartConversationRequest(
+        conversation_id=conversation_id,
+        agent=ACPAgent(acp_command=["codex-acp"], acp_server="codex"),
+        workspace=LocalWorkspace(working_dir=tmp_path / "workspace"),
+    )
+    conversations_dir = tmp_path / "conversations"
+    service = ConversationService(conversations_dir=conversations_dir)
+
+    async with service:
+        await service.activate_credential_binding(
+            conversation_id,
+            "CODEX_AUTH_JSON",
+            HttpVersionedCredentialBinding(
+                "https://app.test/api/credential",
+                {"Authorization": "Bearer initial"},
+            ),
+        )
+        info, _ = await service.start_conversation(request)
+        assert info.id == conversation_id
+
+        meta_file = tmp_path / "conversations" / conversation_id.hex / "meta.json"
+        meta = json.loads(meta_file.read_text())
+        assert meta["required_runtime_credential_bindings"] == ["CODEX_AUTH_JSON"]
+
+    restarted = ConversationService(conversations_dir=conversations_dir)
+    async with restarted:
+        assert await restarted.get_conversation(conversation_id) is not None
+        with pytest.raises(
+            CredentialBindingActivationRequired,
+            match="credential_binding_activation_required",
+        ):
+            await restarted.get_event_service(conversation_id)
+
+        await restarted.activate_credential_binding(
+            conversation_id,
+            "CODEX_AUTH_JSON",
+            HttpVersionedCredentialBinding(
+                "https://app.test/api/credential",
+                {"Authorization": "Bearer resumed"},
+            ),
+        )
+        assert await restarted.get_event_service(conversation_id) is not None
+
+        await restarted.prepare_for_sandbox_pause()
+        with pytest.raises(
+            CredentialBindingActivationRequired,
+            match="credential_binding_activation_required",
+        ):
+            await restarted.get_event_service(conversation_id)
+
+        await restarted.activate_credential_binding(
+            conversation_id,
+            "CODEX_AUTH_JSON",
+            HttpVersionedCredentialBinding(
+                "https://app.test/api/credential",
+                {"Authorization": "Bearer resumed-again"},
+            ),
+        )
+        assert await restarted.get_event_service(conversation_id) is not None
+
+
+@pytest.mark.asyncio
+async def test_callback_bound_conversation_can_be_deleted_without_reactivation(
+    tmp_path,
+) -> None:
+    conversation_id = uuid4()
+    conversations_dir = tmp_path / "conversations"
+    request = StartConversationRequest(
+        conversation_id=conversation_id,
+        agent=ACPAgent(acp_command=["codex-acp"], acp_server="codex"),
+        workspace=LocalWorkspace(working_dir=tmp_path / "workspace"),
+    )
+
+    async with ConversationService(conversations_dir=conversations_dir) as service:
+        await service.activate_credential_binding(
+            conversation_id,
+            "CODEX_AUTH_JSON",
+            HttpVersionedCredentialBinding(
+                "https://app.test/api/credential",
+                {"Authorization": "Bearer initial"},
+            ),
+        )
+        await service.start_conversation(request)
+
+    async with ConversationService(conversations_dir=conversations_dir) as restarted:
+        with pytest.raises(CredentialBindingActivationRequired):
+            await restarted.get_event_service(conversation_id)
+
+        assert await restarted.delete_conversation(conversation_id)
+        assert await restarted.get_conversation(conversation_id) is None
+        assert not (conversations_dir / conversation_id.hex).exists()
+
+
+@pytest.mark.asyncio
+async def test_one_off_credential_survives_cold_restart_without_binding(
+    tmp_path,
+) -> None:
+    conversations_dir = tmp_path / "conversations"
+    cipher = Cipher("stable-conversation-key")
+    request = StartConversationRequest(
+        agent=ACPAgent(acp_command=["codex-acp"], acp_server="codex"),
+        workspace=LocalWorkspace(working_dir=tmp_path / "workspace"),
+        secrets={
+            "CODEX_AUTH_JSON": StaticSecret(value=SecretStr("one-off-credential"))
+        },
+    )
+
+    async with ConversationService(
+        conversations_dir=conversations_dir,
+        cipher=cipher,
+    ) as service:
+        info, _ = await service.start_conversation(request)
+        event_service = await service.get_event_service(info.id)
+        assert event_service is not None
+        assert not event_service.credential_bindings
+        assert not event_service.stored.required_runtime_credential_bindings
+
+    async with ConversationService(
+        conversations_dir=conversations_dir,
+        cipher=cipher,
+    ) as restarted:
+        assert await restarted.get_conversation(info.id) is not None
+        event_service = await restarted.get_event_service(info.id)
+        assert event_service is not None
+        assert not event_service.credential_bindings
+        assert (
+            event_service.stored.secrets["CODEX_AUTH_JSON"].get_value()
+            == "one-off-credential"
+        )
 
 
 @pytest.mark.asyncio
@@ -254,11 +571,13 @@ async def test_managed_start_scrubs_all_durable_credential_copies(tmp_path) -> N
 
         assert "CODEX_AUTH_JSON" not in event_service.stored.secrets
         assert "KEEP" in event_service.stored.secrets
-        assert event_service.stored.agent.agent_context is not None
-        assert "CODEX_AUTH_JSON" not in (
-            event_service.stored.agent.agent_context.secrets or {}
-        )
-        assert "KEEP" in (event_service.stored.agent.agent_context.secrets or {})
+        # The agent is no longer stored on meta.json; it lives on the live
+        # conversation / base_state.json. Assert the scrub there.
+        assert event_service._conversation is not None
+        live_agent = event_service._conversation.agent
+        assert live_agent.agent_context is not None
+        assert "CODEX_AUTH_JSON" not in (live_agent.agent_context.secrets or {})
+        assert "KEEP" in (live_agent.agent_context.secrets or {})
         assert "CODEX_AUTH_JSON" not in state.secret_registry.secret_sources
         assert "KEEP" in state.secret_registry.secret_sources
         assert state.agent.agent_context is not None
@@ -268,7 +587,8 @@ async def test_managed_start_scrubs_all_durable_credential_copies(tmp_path) -> N
         meta = json.loads((conversation_dir / "meta.json").read_text())
         base_state = json.loads((conversation_dir / "base_state.json").read_text())
         assert "CODEX_AUTH_JSON" not in meta["secrets"]
-        assert "CODEX_AUTH_JSON" not in meta["agent"]["agent_context"]["secrets"]
+        # meta.json no longer carries the agent at all.
+        assert "agent" not in meta
         assert "CODEX_AUTH_JSON" not in base_state["agent"]["agent_context"]["secrets"]
         assert "CODEX_AUTH_JSON" not in base_state["secret_registry"]["secret_sources"]
         artifacts = json.dumps(meta) + json.dumps(base_state)
@@ -350,16 +670,17 @@ async def test_late_binding_scrubs_open_uninitialized_conversation(tmp_path) -> 
         assert event_service.credential_bindings["CODEX_AUTH_JSON"] is binding
         assert "CODEX_AUTH_JSON" not in event_service.stored.secrets
         assert "CODEX_AUTH_JSON" not in state.secret_registry.secret_sources
-        assert event_service.stored.agent.agent_context is not None
-        assert "CODEX_AUTH_JSON" not in (
-            event_service.stored.agent.agent_context.secrets or {}
-        )
+        # The agent is on the live conversation / base_state.json, not meta.json.
+        assert event_service._conversation is not None
+        live_agent = event_service._conversation.agent
+        assert live_agent.agent_context is not None
+        assert "CODEX_AUTH_JSON" not in (live_agent.agent_context.secrets or {})
 
         conversation_dir = tmp_path / "conversations" / info.id.hex
         meta = json.loads((conversation_dir / "meta.json").read_text())
         base_state = json.loads((conversation_dir / "base_state.json").read_text())
         assert "CODEX_AUTH_JSON" not in meta["secrets"]
-        assert "CODEX_AUTH_JSON" not in meta["agent"]["agent_context"]["secrets"]
+        assert "agent" not in meta
         assert "CODEX_AUTH_JSON" not in base_state["agent"]["agent_context"]["secrets"]
         assert "CODEX_AUTH_JSON" not in base_state["secret_registry"]["secret_sources"]
         durable = json.dumps(meta) + json.dumps(base_state)
@@ -397,6 +718,73 @@ async def test_late_binding_scrubs_open_uninitialized_conversation(tmp_path) -> 
                     {"Authorization": "Bearer wrong-url"},
                 ),
             )
+
+
+@pytest.mark.asyncio
+async def test_failed_reauthorization_preserves_active_headers(tmp_path) -> None:
+    valid_credential = json.dumps(
+        {
+            "auth_mode": "chatgpt",
+            "tokens": {"refresh_token": "canonical-refresh"},
+        }
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        value = (
+            valid_credential
+            if request.headers["Authorization"] == "Bearer initial"
+            else "invalid-canonical"
+        )
+        return httpx.Response(
+            200,
+            json={"value": value, "version": "v1"},
+            request=request,
+        )
+
+    transport = httpx.MockTransport(handler)
+    binding = HttpVersionedCredentialBinding(
+        "https://app.test/api/credential",
+        {"Authorization": "Bearer initial"},
+        transport=transport,
+    )
+    request = StartConversationRequest(
+        agent=ACPAgent(acp_command=["codex-acp"], acp_server="codex"),
+        workspace=LocalWorkspace(working_dir=tmp_path / "workspace"),
+    )
+
+    async with ConversationService(
+        conversations_dir=tmp_path / "conversations"
+    ) as service:
+        conversation_id = uuid4()
+        await service.activate_credential_binding(
+            conversation_id,
+            "CODEX_AUTH_JSON",
+            binding,
+        )
+        info, _ = await service.start_conversation(
+            request.model_copy(update={"conversation_id": conversation_id})
+        )
+        legacy_auth_file = (
+            tmp_path / "conversations" / info.id.hex / "acp" / "codex" / "auth.json"
+        )
+        legacy_auth_file.parent.mkdir(parents=True)
+        legacy_auth_file.write_text("legacy-file-copy", encoding="utf-8")
+
+        replacement = HttpVersionedCredentialBinding(
+            binding.url,
+            {"Authorization": "Bearer replacement"},
+            transport=transport,
+        )
+        with pytest.raises(CredentialNeedsReauthentication):
+            await service.activate_credential_binding(
+                info.id,
+                "CODEX_AUTH_JSON",
+                replacement,
+            )
+
+        assert binding.headers == {"Authorization": "Bearer initial"}
+        assert binding.authorization_revision == 0
+        assert legacy_auth_file.exists()
 
 
 @pytest.mark.asyncio
@@ -555,7 +943,7 @@ async def test_failed_resume_does_not_retain_plaintext_fallback(
         event_service = service._event_services.pop(info.id)
         await event_service.close()
 
-        async def fail_load(conversation_id):
+        async def fail_load(conversation_id, **kwargs):
             assert conversation_id == info.id
             raise RuntimeError("resume failed")
 
@@ -706,8 +1094,9 @@ async def test_resume_removes_legacy_persisted_credential(tmp_path) -> None:
         meta = json.loads((conversation_dir / "meta.json").read_text())
         base_state = json.loads((conversation_dir / "base_state.json").read_text())
         assert "CODEX_AUTH_JSON" not in meta["secrets"]
-        assert "CODEX_AUTH_JSON" not in meta["agent"]["agent_context"]["secrets"]
-        assert "KEEP" in meta["agent"]["agent_context"]["secrets"]
+        # meta.json no longer carries the agent; the agent (and its scrubbed
+        # agent_context) lives solely in base_state.json.
+        assert "agent" not in meta
         assert "CODEX_AUTH_JSON" not in base_state["agent"]["agent_context"]["secrets"]
         assert "KEEP" in base_state["agent"]["agent_context"]["secrets"]
         assert "CODEX_AUTH_JSON" not in base_state["secret_registry"]["secret_sources"]
