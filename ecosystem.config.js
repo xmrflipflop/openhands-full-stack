@@ -17,6 +17,7 @@
  *   STACK_FE_BIND,  STACK_BE_BIND,  STACK_INGRESS_BIND,
  *   STACK_TAG,      STACK_SESSION_API_KEY,
  *   STACK_WORKSPACE_DIR, STACK_CONVERSATIONS_DIR, STACK_BASH_EVENTS_DIR,
+ *   STACK_CONVERSATION_WORKTREE_ROOT,
  *   STACK_VITE_WORKING_DIR
  *   NODE_ENV is optional and defaults to "development".
  *
@@ -99,6 +100,10 @@ const apiKey = requireStackVar("STACK_SESSION_API_KEY");
 const workspaceDir = requireStackVar("STACK_WORKSPACE_DIR");
 const conversationsDir = requireStackVar("STACK_CONVERSATIONS_DIR");
 const bashEventsDir = requireStackVar("STACK_BASH_EVENTS_DIR");
+// Root dir for per-conversation git worktrees. Fan out to the backend as
+// OH_CONVERSATION_WORKTREE_ROOT so the agent-server writes worktrees here
+// instead of its built-in default, /tmp/conversation-worktrees.
+const conversationWorktreeRoot = requireStackVar("STACK_CONVERSATION_WORKTREE_ROOT");
 // Per-conversation working dir base for conversations without explicit workspace.
 // Frontend reads via import.meta.env.VITE_WORKING_DIR.
 // DEV honors at serve time (Vite exposes VITE_* to import.meta.env).
@@ -221,7 +226,12 @@ const apps = [
     script: AGENT_SERVER_SCRIPT,
     interpreter: UV_VENV_PYTHON,
     args: `--host ${backendBind} --port ${BACKEND_PORT}`,
-    env: { ...sharedEnv, OH_SESSION_API_KEYS_0: apiKey, PYTHONUNBUFFERED: "1" },
+    env: {
+      ...sharedEnv,
+      OH_SESSION_API_KEYS_0: apiKey,
+      OH_CONVERSATION_WORKTREE_ROOT: conversationWorktreeRoot,
+      PYTHONUNBUFFERED: "1",
+    },
     ...supervise,
     ...logFields("backend"),
   },

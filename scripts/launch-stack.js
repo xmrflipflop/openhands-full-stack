@@ -22,6 +22,9 @@
  *   - Resolve the session API key: LOCAL_BACKEND_API_KEY env ->
  *     <workspace_dir>/dev-local-api-key -> generate + persist (FR8b).
  *   - Resolve bind addresses: flag -> legacy DEV_*_BIND env -> loopback (FR17).
+ *   - Resolve the conversation worktree root: flag -> OH_CONVERSATION_WORKTREE_ROOT
+ *     env -> <workspace_dir>/worktrees; exported to the backend as
+ *     OH_CONVERSATION_WORKTREE_ROOT (FR21).
  *   - Production preflight: abort if the prebuilt frontend is missing (FR8c).
  *   - Hand off to PM2: foreground (default) via `pm2-runtime start` with a
  *     throwaway PM2_HOME keyed on the tag; `--background` via `pm2 start`
@@ -34,12 +37,19 @@
  * Usage:
  *   node scripts/launch-stack.js [--fe_port N] [--be_port N] \
  *     [--ingress_port N] [--fe_bind A] [--be_bind A] [--ingress_bind A] \
- *     [--workspace_dir PATH] [--background] [--production] [--dry-run] [--stop]
+ *     [--workspace_dir PATH] [--conversation_worktree_root PATH] \
+ *     [--background] [--production] [--dry-run] [--stop]
  *
  * --workspace_dir: base directory for all agent-server data (conversations,
  *   bash events, session API key). Defaults to <repo_root>/workspace.
  *   Can also be set via WORKSPACE_DIR env var. The session API key is
  *   persisted at <workspace_dir>/dev-local-api-key.
+ *
+ * --conversation_worktree_root: root directory for per-conversation git
+ *   worktrees. Defaults to <workspace_dir>/worktrees; can also be set via the
+ *   upstream OH_CONVERSATION_WORKTREE_ROOT env var. Exported to the backend as
+ *   OH_CONVERSATION_WORKTREE_ROOT so the agent-server writes worktrees there
+ *   instead of its built-in default, /tmp/conversation-worktrees.
  *
  * --stop: stop and delete the background stack for this checkout. Respects
  *   --production: `--stop` alone stops dev-<id>; `--production --stop` stops
@@ -87,6 +97,7 @@ function parseCli(argv) {
       be_bind: { type: "string" },
       ingress_bind: { type: "string" },
       workspace_dir: { type: "string" },
+      conversation_worktree_root: { type: "string" },
       background: { type: "boolean", default: false },
       production: { type: "boolean", default: false },
       "dry-run": { type: "boolean", default: false },
@@ -364,6 +375,7 @@ function resolve(values) {
   let workspaceDir;
   let conversationsDir;
   let bashEventsDir;
+  let conversationWorktreeRoot;
   if (workspaceDirFlag !== undefined) {
     if (workspaceDirFlag === "") {
       throw new Error("Workspace directory cannot be empty");
@@ -379,6 +391,30 @@ function resolve(values) {
   }
   conversationsDir = path.join(workspaceDir, 'conversations');
   bashEventsDir = path.join(workspaceDir, 'bash_events');
+
+  // Conversation worktree root: flag -> upstream OH_CONVERSATION_WORKTREE_ROOT
+  // env -> <workspace_dir>/worktrees. Exported to the backend as
+  // OH_CONVERSATION_WORKTREE_ROOT so the agent-server writes per-conversation
+  // git worktrees inside this checkout's data tree instead of its built-in
+  // default, /tmp/conversation-worktrees (which is wiped on reboot).
+  // A leading ~ is expanded to the home directory (shell-profile continuity).
+  // See docs/prd/7_conversation-worktree-setup.md.
+  const expandTilde = (p) =>
+    p === "~" || p.startsWith("~/") ? path.join(os.homedir(), p.slice(1)) : p;
+  const worktreeFlag = values.conversation_worktree_root;
+  if (worktreeFlag !== undefined) {
+    if (worktreeFlag === "") {
+      throw new Error("Conversation worktree root cannot be empty");
+    }
+    conversationWorktreeRoot = path.resolve(expandTilde(worktreeFlag));
+  } else {
+    const worktreeFromEnv = process.env.OH_CONVERSATION_WORKTREE_ROOT;
+    if (worktreeFromEnv && worktreeFromEnv.trim()) {
+      conversationWorktreeRoot = path.resolve(expandTilde(worktreeFromEnv.trim()));
+    } else {
+      conversationWorktreeRoot = path.join(workspaceDir, "worktrees");
+    }
+  }
 
   // Resolve session API key using the workspace directory for persistence
   const sessionApiKey = resolveSessionApiKey(workspaceDir);
@@ -415,6 +451,7 @@ function resolve(values) {
     workspaceDir,
     conversationsDir,
     bashEventsDir,
+    conversationWorktreeRoot,
     conversationWorkingDir,
   };
 }
@@ -437,6 +474,7 @@ function buildStackEnv(r) {
     STACK_WORKSPACE_DIR: r.workspaceDir,
     STACK_CONVERSATIONS_DIR: r.conversationsDir,
     STACK_BASH_EVENTS_DIR: r.bashEventsDir,
+    STACK_CONVERSATION_WORKTREE_ROOT: r.conversationWorktreeRoot,
     STACK_VITE_WORKING_DIR: r.conversationWorkingDir,
     NODE_ENV: r.nodeEnv,
   };
@@ -546,7 +584,8 @@ function main() {
     console.error(
       `Usage: node scripts/launch-stack.js [--fe_port N] [--be_port N] ` +
         `[--ingress_port N] [--fe_bind A] [--be_bind A] [--ingress_bind A] ` +
-        `[--workspace_dir PATH] [--background] [--production] [--dry-run] [--stop]`,
+        `[--workspace_dir PATH] [--conversation_worktree_root PATH] ` +
+        `[--background] [--production] [--dry-run] [--stop]`,
     );
     process.exit(2);
   }
