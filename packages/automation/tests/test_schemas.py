@@ -1,0 +1,235 @@
+"""Tests for Pydantic response schema UTC datetime normalisation.
+
+SQLite returns naive datetime objects (no tzinfo). Without explicit
+normalisation, Pydantic serialises those as bare ISO 8601 strings such as
+"2026-03-23T09:00:00", which JavaScript's Date constructor interprets as
+*local* time rather than UTC.  The UtcDatetime annotated type (and the
+underlying ensure_utc helper) fix this at the serialisation layer.
+"""
+
+import uuid
+from datetime import UTC, datetime, timedelta, timezone
+from typing import Any
+
+import pytest
+from pydantic import ValidationError
+
+from openhands.automation.schemas import (
+    AutomationResponse,
+    AutomationRunResponse,
+    CronTrigger,
+    RunCompleteRequest,
+    RunStatus,
+)
+from openhands.automation.utils.time import ensure_utc
+from openhands.sdk.event.conversation_error import ConversationErrorEvent
+
+
+_NAIVE = datetime(2026, 3, 23, 9, 0, 0)  # no tzinfo — simulates SQLite output
+_UTC_AWARE = datetime(2026, 3, 23, 9, 0, 0, tzinfo=UTC)
+_OTHER_TZ = datetime(
+    2026, 3, 23, 14, 30, 0, tzinfo=timezone(timedelta(hours=5, minutes=30))
+)
+
+
+class TestEnsureUtc:
+    def test_naive_datetime_gets_utc_tzinfo(self):
+        result = ensure_utc(_NAIVE)
+        assert result.tzinfo is UTC
+
+    def test_naive_datetime_value_is_unchanged(self):
+        result = ensure_utc(_NAIVE)
+        assert result.replace(tzinfo=None) == _NAIVE
+
+    def test_utc_aware_datetime_is_unchanged(self):
+        result = ensure_utc(_UTC_AWARE)
+        assert result is _UTC_AWARE
+
+    def test_non_utc_aware_datetime_is_unchanged(self):
+        result = ensure_utc(_OTHER_TZ)
+        assert result is _OTHER_TZ
+
+
+class TestCronTriggerValidation:
+    def test_accepts_valid_cron_and_timezone(self):
+        trigger = CronTrigger(schedule="0 9 * * *", timezone="America/New_York")
+
+        assert trigger.schedule == "0 9 * * *"
+        assert trigger.timezone == "America/New_York"
+
+    def test_rejects_impossible_cron_schedule(self):
+        with pytest.raises(
+            ValidationError, match="cannot produce any future fire times"
+        ):
+            CronTrigger(schedule="0 0 31 2 *")
+
+    def test_rejects_invalid_timezone(self):
+        with pytest.raises(ValidationError, match="Invalid timezone"):
+            CronTrigger(schedule="0 9 * * *", timezone="Not/A_Timezone")
+
+
+class TestRunCompleteRequest:
+    def test_accepts_legacy_string_error(self):
+        request = RunCompleteRequest(status="FAILED", error="script crashed")
+
+        assert request.error == "script crashed"
+
+    def test_parses_structured_sdk_error(self):
+        error = {
+            "source": "environment",
+            "code": "RuntimeError",
+            "detail": "script crashed",
+            "classification": {"kind": "unknown", "retryable": False},
+        }
+
+        request = RunCompleteRequest(status="FAILED", error=error)
+        assert isinstance(request.error, ConversationErrorEvent)
+
+        assert request.error.code == "RuntimeError"
+        assert request.error.detail == "script crashed"
+        assert request.error.classification is not None
+
+        assert request.error.classification.kind.value == "unknown"
+
+    def test_preserves_legacy_structured_error(self):
+        error = {"detail": "bad config"}
+
+        request = RunCompleteRequest(status="FAILED", error=error)
+
+        assert request.error == error
+
+    def test_accepts_blocking_factor_metadata(self):
+        blocking_factor = {"kind": "config", "reason": "Missing MCP token"}
+
+        request = RunCompleteRequest(
+            status="COMPLETED",
+            blocking_factor=blocking_factor,
+        )
+
+        assert request.blocking_factor == blocking_factor
+
+
+class TestAutomationRunResponseUtcSerialisation:
+    """AutomationRunResponse must include a UTC offset in all datetime fields."""
+
+    def _make_run(self, **overrides: Any) -> AutomationRunResponse:
+        defaults: dict[str, Any] = dict(
+            id=uuid.uuid4(),
+            automation_id=uuid.uuid4(),
+            status=RunStatus.COMPLETED,
+            error_detail=None,
+            conversation_id=None,
+            timeout_at=None,
+            sandbox_id=None,
+            bash_command_id=None,
+            run_metadata=None,
+            created_at=_NAIVE,
+            started_at=_NAIVE,
+            completed_at=_NAIVE,
+        )
+        defaults.update(overrides)
+        return AutomationRunResponse(**defaults)
+
+    def test_naive_created_at_serialises_with_utc_offset(self):
+        run = self._make_run()
+        data = run.model_dump(mode="json")
+        assert data["created_at"].endswith("+00:00") or data["created_at"].endswith("Z")
+
+    def test_naive_started_at_serialises_with_utc_offset(self):
+        run = self._make_run()
+        data = run.model_dump(mode="json")
+        assert data["started_at"].endswith("+00:00") or data["started_at"].endswith("Z")
+
+    def test_status_detail_serialises_as_json_object(self):
+        run = self._make_run(
+            status_detail={
+                "phase": "verification",
+                "kind": "rate_limited",
+                "transient": True,
+            }
+        )
+        data = run.model_dump(mode="json")
+
+        assert data["status_detail"] == {
+            "phase": "verification",
+            "kind": "rate_limited",
+            "transient": True,
+        }
+
+    def test_naive_completed_at_serialises_with_utc_offset(self):
+        run = self._make_run()
+        data = run.model_dump(mode="json")
+        assert data["completed_at"].endswith("+00:00") or data["completed_at"].endswith(
+            "Z"
+        )
+
+    def test_none_optional_fields_remain_none(self):
+        run = self._make_run(started_at=None, completed_at=None, timeout_at=None)
+        data = run.model_dump(mode="json")
+        assert data["started_at"] is None
+        assert data["completed_at"] is None
+        assert data["timeout_at"] is None
+
+    def test_already_utc_aware_datetime_serialises_correctly(self):
+        run = self._make_run(created_at=_UTC_AWARE)
+        data = run.model_dump(mode="json")
+        assert data["created_at"].endswith("+00:00") or data["created_at"].endswith("Z")
+
+
+class TestAutomationResponseUtcSerialisation:
+    """AutomationResponse datetime fields also emit UTC offsets."""
+
+    def _make_automation(self, **overrides: Any) -> AutomationResponse:
+        defaults: dict[str, Any] = dict(
+            id=uuid.uuid4(),
+            user_id=uuid.uuid4(),
+            org_id=uuid.uuid4(),
+            model=None,
+            name="Test",
+            prompt=None,
+            trigger={"type": "cron", "schedule": "0 9 * * 1", "timezone": "UTC"},
+            tarball_path="s3://bucket/key.tar.gz",
+            setup_script_path=None,
+            entrypoint="python main.py",
+            timeout=None,
+            keep_alive=True,
+            enabled=True,
+            last_triggered_at=_NAIVE,
+            created_at=_NAIVE,
+            updated_at=_NAIVE,
+        )
+        defaults.update(overrides)
+        return AutomationResponse(**defaults)
+
+    def test_naive_created_at_serialises_with_utc_offset(self):
+        automation = self._make_automation()
+        data = automation.model_dump(mode="json")
+        assert data["created_at"].endswith("+00:00") or data["created_at"].endswith("Z")
+
+    def test_disabled_metadata_serialises_for_api_consumers(self):
+        automation = self._make_automation(
+            enabled=False,
+            disabled_reason="auth: Invalid API key",
+            disabled_detail={"kind": "auth", "threshold": 3},
+            disabled_at=_NAIVE,
+        )
+        data = automation.model_dump(mode="json")
+
+        assert data["enabled"] is False
+        assert data["disabled_reason"] == "auth: Invalid API key"
+        assert data["disabled_detail"] == {"kind": "auth", "threshold": 3}
+        assert data["disabled_at"].endswith("+00:00") or data["disabled_at"].endswith(
+            "Z"
+        )
+
+    def test_naive_last_triggered_at_serialises_with_utc_offset(self):
+        automation = self._make_automation()
+        data = automation.model_dump(mode="json")
+        assert data["last_triggered_at"].endswith("+00:00") or data[
+            "last_triggered_at"
+        ].endswith("Z")
+
+    def test_none_last_triggered_at_remains_none(self):
+        automation = self._make_automation(last_triggered_at=None)
+        data = automation.model_dump(mode="json")
+        assert data["last_triggered_at"] is None

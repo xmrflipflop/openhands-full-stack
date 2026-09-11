@@ -1,0 +1,1088 @@
+"""Pydantic request/response schemas for the API."""
+
+import json
+import re
+import uuid
+from enum import StrEnum
+from typing import Annotated, Any, Final, Literal
+
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Discriminator,
+    Field,
+    Tag,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
+from pydantic.alias_generators import to_camel
+
+from openhands.automation.constants import MODEL_PROFILE_PATTERN
+from openhands.automation.providers import (
+    DEFAULT_VERIFIER,
+    is_builtin_source,
+    reserved_sources,
+    verifier_schemes,
+)
+from openhands.automation.utils.cron import (
+    validate_cron_schedule as validate_cron_schedule_value,
+    validate_timezone_name,
+)
+from openhands.automation.utils.time import UtcDatetime
+from openhands.automation.utils.timeout import (
+    build_automation_timeout_description,
+    validate_automation_timeout,
+)
+from openhands.sdk.event.conversation_error import ConversationErrorEvent
+
+
+# Allowed URI schemes for tarball_path (includes internal upload scheme)
+_TARBALL_SCHEME_RE = re.compile(r"^(s3|gs|https?|oh-internal)://")
+
+# Shell metacharacters that should not appear in entrypoints or script paths
+_SHELL_META_RE = re.compile(r"[;&|`$(){}<>!\\\n\r]")
+
+# Path traversal pattern
+_PATH_TRAVERSAL_RE = re.compile(r"(^|/)\.\.(/|$)")
+
+# Control characters (including newlines) collapsed out of run phase messages
+_PHASE_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]+")
+
+
+class CronTrigger(BaseModel):
+    """Cron-based trigger configuration."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["cron"] = "cron"
+    schedule: str = Field(..., description="Cron expression, e.g. '0 9 * * 5'")
+    timezone: str = Field(default="UTC", description="IANA timezone name")
+
+    @field_validator("schedule")
+    @classmethod
+    def validate_cron_schedule(cls, v: str) -> str:
+        return validate_cron_schedule_value(v)
+
+    @field_validator("timezone")
+    @classmethod
+    def validate_timezone(cls, v: str) -> str:
+        return validate_timezone_name(v)
+
+
+class EventTrigger(BaseModel):
+    """
+    Event-based trigger configuration.
+
+    Triggers automation when a matching event is received from the source.
+    Uses pattern matching via the `on` field and optional JMESPath filter.
+
+    ## Event Key Format
+
+    Events are identified by "{event_type}.{action}" or just "{event_type}" for
+    events without actions (like push).
+
+    Examples:
+    - `pull_request.opened` - PR opened
+    - `pull_request.closed` - PR closed
+    - `pull_request.*` - Any PR activity (wildcard)
+    - `push` - Code pushed
+    - `issue.created` - Linear issue created
+
+    ## Filter Expressions (JMESPath DSL)
+
+    The `filter` field accepts a JMESPath expression that is evaluated against
+    the raw webhook payload. The expression must evaluate to a truthy value
+    for the event to match.
+
+    **Available functions:**
+    - `contains(array, value)` - Check if array contains value
+    - `glob(str, pattern)` - Wildcard matching (e.g., 'org/*')
+    - `icontains(str, substr)` - Case-insensitive substring match
+    - `regex(str, pattern)` - Regular expression match
+    - `starts_with(str, prefix)` - Check if string starts with prefix
+    - `ends_with(str, suffix)` - Check if string ends with suffix
+    - `lower(str)` / `upper(str)` - Case conversion
+
+    **Boolean operators:** `&&` (and), `||` (or), `!` (not)
+
+    ## Examples
+
+    ```json
+    // GitHub: Match @openhands-resolver mentions in comments
+    {
+      "source": "github",
+      "on": "issue_comment.created",
+      "filter": "icontains(comment.body, '@openhands-resolver')"
+    }
+
+    // GitHub: PR opened in specific repo
+    {
+      "source": "github",
+      "on": "pull_request.opened",
+      "filter": "repository.full_name == 'myorg/myrepo'"
+    }
+
+    // GitHub: PR with 'bug' label in any org repo
+    {
+      "source": "github",
+      "on": "pull_request.opened",
+      "filter": "glob(repository.full_name, 'myorg/*')"
+    }
+
+    // GitHub: Push to main or release branches
+    {
+      "source": "github",
+      "on": "push",
+      "filter": "glob(ref, 'refs/heads/main') || glob(ref, 'refs/heads/release/*')"
+    }
+
+    // No filter - match any event of this type
+    {"source": "github", "on": "push"}
+    ```
+
+    ## Conversation reuse
+
+    `destination: continue_conversation` sends events about one external
+    subject -- a Slack thread, a pull request -- to the same conversation
+    instead of starting a run each time.
+
+    ```json
+    {"source": "slack", "on": "app_mention",
+     "destination": "continue_conversation"}
+    ```
+
+    `subject_key_expr` names that subject, for every source alike.
+
+    ```json
+    {"source": "github", "on": "issue_comment.created",
+     "destination": "continue_conversation",
+     "subject_key_expr":
+       "(pull_request.number || issue.number || number) && join('',
+          [repository.full_name, '#', to_string(
+            pull_request.number || issue.number || number)])"}
+    ```
+
+    For Slack over the socket transport, where the payload is the raw envelope:
+
+    ```json
+    {"source": "slack", "on": "app_mention",
+     "destination": "continue_conversation",
+     "subject_key_expr":
+       "join('/', [team_id, event.channel, event.thread_ts || event.ts])"}
+    ```
+
+    The `|| event.ts` half is load-bearing: the mention that opens a thread
+    carries no `thread_ts`, and its own `ts` is what becomes the thread id once
+    somebody replies. Without it the opener and its first reply are two
+    subjects.
+
+    `turn_text_expr` renders the turn. Without one the event is rendered as
+    the message a human wrote, and a shape nothing recognises travels as
+    verbatim JSON.
+
+    ```json
+    {"source": "github", "on": "issue_comment.created",
+     "destination": "continue_conversation",
+     "turn_text_expr": "comment.body"}
+    ```
+
+    By default a delivered turn also wakes the agent. `wake_agent: false`
+    appends it to the conversation and leaves it there, so the script decides
+    when to act on what has accumulated.
+
+    ```json
+    {"source": "slack", "on": "app_mention",
+     "destination": "continue_conversation", "wake_agent": false}
+    ```
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["event"] = "event"
+    source: str = Field(
+        ...,
+        description="Event source: 'github' or custom webhook source name",
+    )
+    on: str | list[str] = Field(
+        ...,
+        description=(
+            "Event key pattern(s) to match. "
+            "Format: 'event_type.action' or 'event_type'. "
+            "Supports wildcards: 'pull_request.*' matches any PR action. "
+            "Can be a single pattern or list of patterns."
+        ),
+    )
+    filter: str | None = Field(
+        default=None,
+        description=(
+            "JMESPath expression evaluated against the raw payload. "
+            "Must evaluate to truthy for the event to match. "
+            "Functions: contains(), glob(), icontains(), regex(). "
+            "Example: glob(repository.full_name, 'org/*') && "
+            "icontains(comment.body, '@openhands-resolver')"
+        ),
+    )
+
+    destination: Literal["dispatch_run", "continue_conversation"] = Field(
+        default="dispatch_run",
+        description=(
+            "Where a matching event goes. 'dispatch_run' starts a fresh run. "
+            "'continue_conversation' sends it as another turn on the "
+            "subject's conversation, falling back to a run when there is none."
+        ),
+    )
+    subject_key_expr: str | None = Field(
+        default=None,
+        description=(
+            "JMESPath expression yielding the subject key events are grouped "
+            "by. Required for 'continue_conversation'; without it the event "
+            "starts a run as usual. For GitHub: "
+            "(pull_request.number || issue.number || number) && join('', "
+            "[repository.full_name, '#', to_string(pull_request.number || "
+            "issue.number || number)]). "
+            "The fallback chain keeps a pull request and its comments on one "
+            "subject; the leading guard keeps an event with no number, such "
+            "as a push, from becoming the subject '<repo>#null'. "
+            "For Slack: join('/', [team_id, event.channel, event.thread_ts "
+            "|| event.ts]). "
+            "Ignored unless destination is 'continue_conversation'."
+        ),
+    )
+    turn_text_expr: str | None = Field(
+        default=None,
+        description=(
+            "JMESPath expression rendering the event as the follow-up turn's "
+            "text, e.g. comment.body, overriding the built-in rendering. "
+            "Ignored unless destination is 'continue_conversation'."
+        ),
+    )
+    wake_agent: bool = Field(
+        default=True,
+        description=(
+            "Whether a delivered turn also starts the agent loop. False leaves "
+            "it unanswered, making the conversation the buffer the script "
+            "drains. Ignored unless destination is 'continue_conversation'."
+        ),
+    )
+
+    @field_validator("filter", "subject_key_expr", "turn_text_expr")
+    @classmethod
+    def validate_jmespath_expression(
+        cls, v: str | None, info: ValidationInfo
+    ) -> str | None:
+        """Validate every JMESPath field at creation time.
+
+        One validator over all of them, so a fourth cannot be added without
+        validation. It matters more here than for most fields: an unchecked
+        typo is indistinguishable from the feature being switched off --
+        `subject_key_expr` silently stops threading, `turn_text_expr` silently
+        falls back to the built-in rendering.
+        """
+        if v:
+            from openhands.automation.filter_eval import validate_filter
+
+            is_valid, error = validate_filter(v)
+            if not is_valid:
+                raise ValueError(f"Invalid {info.field_name} expression: {error}")
+        return v
+
+    @property
+    def event_patterns(self) -> list[str]:
+        """Get the event patterns as a list."""
+        if isinstance(self.on, str):
+            return [self.on]
+        return self.on
+
+
+def _get_trigger_discriminator(v: dict | BaseModel) -> str:
+    """Discriminator function for Pydantic's discriminated union.
+
+    Returns the trigger type string, which Pydantic uses to select the
+    correct model (CronTrigger or EventTrigger) from the union.
+
+    Why sentinel instead of raising ValueError:
+        Pydantic discriminator functions must return a string - they cannot
+        raise exceptions. By returning an invalid sentinel value, Pydantic
+        generates a proper ValidationError with context like:
+        "Input tag '__missing_trigger_type__' found using 'type' does not
+        match any of the expected tags: 'cron', 'event'"
+        This produces a user-friendly 422 response via FastAPI.
+    """
+    if isinstance(v, dict):
+        trigger_type = v.get("type")
+        if not trigger_type:
+            return "__missing_trigger_type__"
+        return trigger_type
+    return getattr(v, "type")
+
+
+# Union type for all triggers, using discriminated union
+Trigger = Annotated[
+    Annotated[CronTrigger, Tag("cron")] | Annotated[EventTrigger, Tag("event")],
+    Discriminator(_get_trigger_discriminator),
+]
+
+
+class RunStatus(StrEnum):
+    """Status of an automation run (for API responses)."""
+
+    PENDING = "PENDING"
+    RUNNING = "RUNNING"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+    SKIPPED = "SKIPPED"
+
+
+def validate_command_string(
+    v: str | None, field_name: str, *, allow_none: bool = True
+) -> str | None:
+    """Validate a command/path is relative and safe.
+
+    Rejects traversal patterns and shell metacharacters.
+
+    Used for both entrypoint and setup_script_path validation, including
+    by git_sync/loop.py when importing automations from git.
+
+    Args:
+        v: The value to validate
+        field_name: Field name for error messages
+        allow_none: If True, None values pass through unchanged
+
+    Returns:
+        The validated value
+    """
+    if v is None:
+        if allow_none:
+            return v
+        raise ValueError(f"{field_name} is required")
+    if not v.strip():
+        raise ValueError(f"{field_name} must not be blank")
+    if v.startswith("/"):
+        raise ValueError(f"{field_name} must be a relative path, not an absolute path")
+    if _PATH_TRAVERSAL_RE.search(v):
+        raise ValueError(f"{field_name} must not contain path traversal (..)")
+    if _SHELL_META_RE.search(v):
+        raise ValueError(
+            f"{field_name} must not contain shell metacharacters (;&|`$(){{}}<>!\\\\)"
+        )
+    return v
+
+
+# --- Template provenance ---
+
+# Keeps an opaque payload from bloating the preset_metadata JSON column.
+MAX_TEMPLATE_CONFIG_BYTES: Final[int] = 16_384
+
+
+class TemplateProvenance(BaseModel):
+    """The extension-owned template an automation was created from.
+
+    Stored verbatim under ``preset_metadata["template"]`` and never validated
+    against any catalog, which OpenHands/extensions owns. Must not contain
+    secrets. Every creation path accepts it, which is why it lives here rather
+    than in ``preset_router``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+        description="Identifier of the extension template (catalog entry id).",
+    )
+    version: str = Field(
+        ...,
+        min_length=1,
+        max_length=50,
+        description="Version of the template at creation time.",
+    )
+    config: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Non-secret configuration the user submitted when enabling the "
+            "template (e.g. setup form values)."
+        ),
+    )
+
+    @field_validator("config")
+    @classmethod
+    def validate_config_size(cls, v: dict[str, Any] | None) -> dict[str, Any] | None:
+        if v is not None and len(json.dumps(v)) > MAX_TEMPLATE_CONFIG_BYTES:
+            raise ValueError(
+                f"config must serialize to at most {MAX_TEMPLATE_CONFIG_BYTES} bytes"
+            )
+        return v
+
+
+# --- Requests ---
+
+
+class CreateAutomationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(..., min_length=1, max_length=500)
+    model: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=64,
+        pattern=MODEL_PROFILE_PATTERN,
+        description=(
+            "Model profile name to use for automation runs. Defaults to the active "
+            "profile at creation time when omitted."
+        ),
+    )
+
+    trigger: Trigger = Field(
+        ..., description="Trigger configuration (cron or event-based)"
+    )
+    tarball_path: str = Field(
+        ..., description="Path to SDK code tarball (e.g., S3 or GCS URL)"
+    )
+    setup_script_path: str | None = Field(
+        default=None,
+        description="Relative path inside tarball to setup script (e.g., setup.sh)",
+    )
+    entrypoint: str = Field(
+        ..., description='Command to execute the automation (e.g., "uv run script.py")'
+    )
+    timeout: int | None = Field(
+        default=None,
+        description=build_automation_timeout_description(include_default=True),
+    )
+    keep_alive: bool | None = Field(
+        default=None,
+        description=(
+            "If true, leave the sandbox for runtime TTL cleanup after the run "
+            "finishes. If false or null, explicitly clean it up after "
+            "completion (or after post-run callbacks, when configured)."
+        ),
+    )
+    template: TemplateProvenance | None = Field(
+        default=None,
+        description=(
+            "Provenance of the extension template this automation comes from. "
+            "Makes creation idempotent: a live automation for the same user and "
+            "template id is returned unchanged with HTTP 200."
+        ),
+    )
+
+    @field_validator("tarball_path")
+    @classmethod
+    def validate_tarball_path(cls, v: str) -> str:
+        if not _TARBALL_SCHEME_RE.match(v):
+            raise ValueError(
+                "tarball_path must start with s3://, gs://, http://, or https://"
+            )
+        return v
+
+    @field_validator("setup_script_path")
+    @classmethod
+    def validate_setup_script_path(cls, v: str | None) -> str | None:
+        return validate_command_string(v, "setup_script_path")
+
+    @field_validator("entrypoint")
+    @classmethod
+    def validate_entrypoint(cls, v: str) -> str:
+        result = validate_command_string(v, "entrypoint", allow_none=False)
+        assert result is not None  # satisfy type checker
+        return result
+
+    @field_validator("timeout")
+    @classmethod
+    def validate_timeout(cls, v: int | None) -> int | None:
+        return validate_automation_timeout(v)
+
+    @model_validator(mode="after")
+    def keep_alive_for_continued_conversations(self) -> "CreateAutomationRequest":
+        """A continued conversation outlives its run, so its sandbox must too.
+
+        Settling this at creation keeps the cleanup paths checking `keep_alive`
+        alone, rather than every deletion site re-deriving that a run holding a
+        subject is implicitly kept.
+        """
+        trigger = self.trigger
+        if not isinstance(trigger, EventTrigger):
+            return self
+        if trigger.destination != "continue_conversation":
+            return self
+        if self.keep_alive is False:
+            raise ValueError(
+                "keep_alive cannot be false when destination is "
+                "'continue_conversation': deleting the sandbox would destroy "
+                "the conversation the next event continues"
+            )
+        self.keep_alive = True
+        return self
+
+
+class UpdateAutomationRequest(BaseModel):
+    """Request to partially update an automation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = Field(default=None, min_length=1, max_length=500)
+    model: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=64,
+        pattern=MODEL_PROFILE_PATTERN,
+        description=(
+            "Model profile name to use for automation runs. Defaults to the active "
+            "profile at creation time when omitted."
+        ),
+    )
+
+    prompt: str | None = Field(default=None, max_length=50000)
+    trigger: Trigger | None = Field(
+        default=None, description="Trigger configuration (cron or event-based)"
+    )
+    tarball_path: str | None = Field(default=None)
+    setup_script_path: str | None = Field(default=None)
+    entrypoint: str | None = Field(default=None)
+    timeout: int | None = Field(
+        default=None,
+        description=build_automation_timeout_description(include_default=False),
+    )
+    keep_alive: bool | None = Field(default=None)
+    enabled: bool | None = None
+
+    @field_validator("tarball_path")
+    @classmethod
+    def validate_tarball_path(cls, v: str | None) -> str | None:
+        if v is not None and not _TARBALL_SCHEME_RE.match(v):
+            raise ValueError(
+                "tarball_path must start with s3://, gs://, http://, or https://"
+            )
+        return v
+
+    @field_validator("setup_script_path")
+    @classmethod
+    def validate_setup_script_path(cls, v: str | None) -> str | None:
+        return validate_command_string(v, "setup_script_path")
+
+    @field_validator("entrypoint")
+    @classmethod
+    def validate_entrypoint(cls, v: str | None) -> str | None:
+        return validate_command_string(v, "entrypoint")
+
+    @field_validator("timeout")
+    @classmethod
+    def validate_timeout(cls, v: int | None) -> int | None:
+        return validate_automation_timeout(v)
+
+
+# --- Webhook Schemas ---
+
+
+class WebhookConfig(BaseModel):
+    """Configuration for processing a webhook."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    secret: str
+    is_builtin: bool = False  # True for built-in OpenHands-forwarded sources
+    event_key_expr: str = "type"  # JMESPath expression for extracting event key
+    signature_header: str = "X-Hub-Signature-256"  # HTTP header for signature
+    signature_scheme: str = DEFAULT_VERIFIER  # a verifier in providers.VERIFIERS
+
+
+class EventResponse(BaseModel):
+    """Response for event processing."""
+
+    received: bool
+    matched: int
+    runs_created: list[str]  # List of run IDs created
+    # Conversations continued instead of starting a run.
+    conversations_continued: list[str] = Field(default_factory=list)
+
+
+class EventDetectionRule(BaseModel):
+    """Payload rule used to detect a source event type."""
+
+    event_type: str
+    jmespath: str
+
+
+class RequestedEventTypesResponse(BaseModel):
+    """Event types currently requested by enabled automations for a source."""
+
+    source: str
+    event_types: list[str]
+    event_detection_rules: list[EventDetectionRule] = Field(default_factory=list)
+
+
+# Valid source name pattern: lowercase alphanumeric with hyphens, 1-50 chars
+_SOURCE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,48}[a-z0-9]$|^[a-z0-9]$")
+
+# Snapshot for introspection; validation calls `is_builtin_source()` so a
+# provider registered after import time is still protected.
+RESERVED_SOURCES = reserved_sources()
+
+
+# Valid HTTP header name pattern
+_HEADER_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9-]{0,98}[A-Za-z0-9]$|^[A-Za-z]$")
+
+
+def _validate_signature_scheme(v: str) -> str:
+    """Reject a scheme with no verifier behind it."""
+    schemes = verifier_schemes()
+    if v not in schemes:
+        raise ValueError(
+            f"Invalid signature_scheme '{v}'. Must be one of: "
+            f"{', '.join(sorted(schemes))}"
+        )
+    return v
+
+
+class CustomWebhookCreate(BaseModel):
+    """Request schema for creating a custom webhook."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(
+        ...,
+        min_length=1,
+        max_length=255,
+        description="Human-readable name for this webhook",
+    )
+    source: str = Field(
+        ...,
+        min_length=1,
+        max_length=50,
+        description=(
+            "Unique source identifier (lowercase, alphanumeric with hyphens). "
+            "Used in the webhook URL: /v1/events/{org_id}/{source}"
+        ),
+    )
+    event_key_expr: str = Field(
+        default="type",
+        max_length=500,
+        description=(
+            "JMESPath expression to extract event type from payload. "
+            "Examples: 'type', 'event.type', 'type || event_name'"
+        ),
+    )
+    signature_header: str = Field(
+        default="X-Signature-256",
+        max_length=100,
+        description=(
+            "HTTP header name containing the HMAC signature. "
+            "Examples: 'X-Signature-256', 'Stripe-Signature', 'X-Slack-Signature'"
+        ),
+    )
+    signature_scheme: str = Field(
+        default=DEFAULT_VERIFIER,
+        max_length=50,
+        description=(
+            "How the value in `signature_header` is computed. "
+            "'hmac_sha256_hex' (default) is a hex digest over the raw body "
+            "(GitHub, Linear). 'standard_webhooks' follows "
+            "standardwebhooks.com (GitLab 19.1+ signing tokens, Svix) and also "
+            "reads the webhook-id and webhook-timestamp headers. 'slack_v0' is "
+            "the Slack Events API scheme and also reads "
+            "X-Slack-Request-Timestamp. The timestamped schemes reject "
+            "deliveries outside a 5-minute replay window."
+        ),
+    )
+    webhook_secret: str | None = Field(
+        default=None,
+        min_length=8,
+        max_length=255,
+        description=(
+            "Optional signing secret. If not provided, one will be generated. "
+            "Use this when the external service provides a fixed secret."
+        ),
+    )
+
+    @field_validator("source")
+    @classmethod
+    def validate_source_name(cls, v: str) -> str:
+        """Validate source name format and check for reserved names."""
+        v_lower = v.lower()
+        if is_builtin_source(v_lower):
+            raise ValueError(
+                f"'{v}' is a reserved source name. "
+                "Use the built-in integration instead."
+            )
+        if not _SOURCE_NAME_RE.match(v_lower):
+            raise ValueError(
+                "Source must be lowercase alphanumeric with hyphens, 1-50 chars, "
+                "starting and ending with alphanumeric"
+            )
+        return v_lower
+
+    @field_validator("signature_scheme")
+    @classmethod
+    def validate_signature_scheme(cls, v: str) -> str:
+        """Validate the scheme names a registered verifier."""
+        return _validate_signature_scheme(v)
+
+    @field_validator("event_key_expr")
+    @classmethod
+    def validate_event_key_expr(cls, v: str) -> str:
+        """Validate JMESPath expression syntax."""
+        import jmespath
+        from jmespath import exceptions as jmespath_exceptions
+
+        try:
+            jmespath.compile(v)
+        except jmespath_exceptions.JMESPathError as e:
+            raise ValueError(f"Invalid JMESPath expression: {e}") from e
+        return v
+
+    @field_validator("signature_header")
+    @classmethod
+    def validate_signature_header(cls, v: str) -> str:
+        """Validate HTTP header name format."""
+        if not _HEADER_NAME_RE.match(v):
+            raise ValueError(
+                "Header must be alphanumeric with hyphens, 1-100 chars, "
+                "starting with a letter"
+            )
+        return v
+
+
+class CustomWebhookUpdate(BaseModel):
+    """Request schema for updating a custom webhook."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = Field(default=None, min_length=1, max_length=255)
+    event_key_expr: str | None = Field(default=None, max_length=500)
+    signature_header: str | None = Field(default=None, max_length=100)
+    signature_scheme: str | None = Field(default=None, max_length=50)
+    enabled: bool | None = None
+
+    @field_validator("signature_scheme")
+    @classmethod
+    def validate_signature_scheme(cls, v: str | None) -> str | None:
+        """Validate the scheme names a registered verifier, if provided."""
+        if v is None:
+            return v
+        return _validate_signature_scheme(v)
+
+    @field_validator("event_key_expr")
+    @classmethod
+    def validate_event_key_expr(cls, v: str | None) -> str | None:
+        """Validate JMESPath expression syntax if provided."""
+        if v is None:
+            return v
+        import jmespath
+        from jmespath import exceptions as jmespath_exceptions
+
+        try:
+            jmespath.compile(v)
+        except jmespath_exceptions.JMESPathError as e:
+            raise ValueError(f"Invalid JMESPath expression: {e}") from e
+        return v
+
+    @field_validator("signature_header")
+    @classmethod
+    def validate_signature_header(cls, v: str | None) -> str | None:
+        """Validate HTTP header name format if provided."""
+        if v is None:
+            return v
+        if not _HEADER_NAME_RE.match(v):
+            raise ValueError(
+                "Header must be alphanumeric with hyphens, 1-100 chars, "
+                "starting with a letter"
+            )
+        return v
+
+
+class CustomWebhookResponse(BaseModel):
+    """Response schema for custom webhook (without secret)."""
+
+    id: uuid.UUID
+    org_id: uuid.UUID
+    name: str
+    source: str
+    webhook_url: str
+    event_key_expr: str
+    signature_header: str
+    signature_scheme: str
+    enabled: bool
+    created_at: UtcDatetime
+    updated_at: UtcDatetime
+
+    model_config = {"from_attributes": True}
+
+
+class CustomWebhookCreateResponse(CustomWebhookResponse):
+    """Response schema for webhook creation.
+
+    webhook_secret is only included when the system generated it (user didn't
+    provide one). If the user provided their own secret, it won't be echoed back.
+    """
+
+    webhook_secret: str | None = Field(
+        default=None,
+        description=(
+            "Webhook signing secret (only shown if system-generated). "
+            "Store securely - only shown on create."
+        ),
+    )
+
+
+class CustomWebhookSecretResponse(BaseModel):
+    """Response schema for secret rotation."""
+
+    webhook_secret: str = Field(
+        ...,
+        description="New webhook signing secret. Store securely - only shown once.",
+    )
+
+
+class CustomWebhookListResponse(BaseModel):
+    """Response schema for listing webhooks."""
+
+    webhooks: list[CustomWebhookResponse]
+    total: int
+
+
+class TelemetryConsentRequest(BaseModel):
+    """Frontend telemetry consent state for local automation telemetry."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    consent_granted: bool
+    frontend_distinct_id: str | None = Field(default=None, max_length=256)
+
+
+class TelemetryConsentResponse(BaseModel):
+    """Stored aggregate telemetry consent for this automation service."""
+
+    consent_granted: bool
+
+
+# --- Responses ---
+
+
+class AutomationResponse(BaseModel):
+    id: uuid.UUID
+    user_id: uuid.UUID
+    org_id: uuid.UUID
+    model: str | None
+
+    name: str
+    prompt: str | None
+    preset_metadata: dict | None = None
+    trigger: dict
+    tarball_path: str
+    setup_script_path: str | None
+    entrypoint: str
+    timeout: int | None
+    keep_alive: bool | None
+    enabled: bool
+    disabled_reason: str | None = None
+    disabled_detail: dict[str, Any] | None = None
+    disabled_at: UtcDatetime | None = None
+    last_triggered_at: UtcDatetime | None
+    created_at: UtcDatetime
+    updated_at: UtcDatetime
+
+    model_config = {"from_attributes": True}
+
+
+class AutomationListResponse(BaseModel):
+    automations: list[AutomationResponse]
+    total: int
+
+
+# --- Run schemas ---
+
+
+class RunCompleteRequest(BaseModel):
+    """Payload sent by the SDK's OpenHandsCloudWorkspace on context manager exit."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["COMPLETED", "FAILED"]
+    run_id: str | None = None
+    conversation_id: str | None = None
+    error: str | ConversationErrorEvent | dict[str, Any] | None = None
+    cost: float | None = None
+    blocking_factor: dict[str, Any] | None = None
+    task_outcome: dict[str, Any] | None = None
+
+    @field_validator("error", mode="before")
+    @classmethod
+    def parse_sdk_conversation_error(cls, value: Any) -> Any:
+        """Coerce typed SDK callback errors while preserving legacy payloads."""
+        if not isinstance(value, dict):
+            return value
+        try:
+            return ConversationErrorEvent.model_validate(value)
+        except ValueError:
+            return value
+
+
+class RunPhaseRequest(BaseModel):
+    """Live progress phase reported by the automation entrypoint."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    phase: str = Field(..., min_length=1, max_length=200)
+
+    @field_validator("phase", mode="before")
+    @classmethod
+    def normalize_phase(cls, v: Any) -> Any:
+        if not isinstance(v, str):
+            return v
+        # Collapse control chars/newlines and runs of whitespace; strip ends.
+        return " ".join(_PHASE_CONTROL_CHARS_RE.sub(" ", v).split())
+
+
+class AutomationRunResponse(BaseModel):
+    """Response for a single automation run."""
+
+    id: uuid.UUID
+    automation_id: uuid.UUID
+    status: RunStatus
+    error_detail: str | None
+    status_detail: dict[str, Any] | None = None
+    current_phase: str | None = None
+    conversation_id: str | None
+    cost: float | None = None
+    timeout_at: UtcDatetime | None
+    sandbox_id: str | None
+    bash_command_id: str | None = None
+    run_metadata: dict[str, Any] | None = None
+    created_at: UtcDatetime
+    started_at: UtcDatetime | None
+    completed_at: UtcDatetime | None
+
+    model_config = {"from_attributes": True}
+
+
+class AutomationRunListResponse(BaseModel):
+    """Response for listing automation runs (Phase 1b)."""
+
+    runs: list[AutomationRunResponse]
+    total: int
+    # Lifetime run counts by status, unaffected by pagination. Sparse: only
+    # statuses with at least one run appear, so a missing key means zero.
+    status_counts: dict[RunStatus, int] = Field(default_factory=dict)
+
+
+# --- Capability and Preflight Schemas ---
+
+
+class _SetupContractModel(BaseModel):
+    """Base for the extension-owned setup contract, which is camelCase.
+
+    The rest of this service is snake_case. These two endpoints answer a
+    contract authored in OpenHands/extensions, whose catalog, schema and
+    TypeScript types are camelCase throughout.
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+
+class CronCapabilities(_SetupContractModel):
+    """Deployment constraints on cron triggers."""
+
+    min_interval_seconds: int = Field(
+        ...,
+        description="Shortest gap between fire times this deployment can honour",
+    )
+    timezones: list[str] = Field(..., description="Accepted IANA timezone names")
+
+
+class EventCapabilities(_SetupContractModel):
+    """Deployment constraints on event triggers."""
+
+    filter_language: Literal["jmespath"] = "jmespath"
+    filter_functions: list[str] = Field(
+        ..., description="Functions a filter expression may call"
+    )
+
+
+class TriggerCapabilities(_SetupContractModel):
+    """Per-trigger-kind constraints. A kind is present only when supported."""
+
+    cron: CronCapabilities | None = None
+    event: EventCapabilities | None = None
+
+
+class CapabilitiesResponse(_SetupContractModel):
+    """What this deployment supports, discovered before a setup form renders."""
+
+    ready: bool = Field(..., description="Whether the service can accept new work")
+    max_automation_timeout_seconds: int = Field(
+        ...,
+        description="Maximum timeout the service accepts for an automation run",
+    )
+    trigger_kinds: list[str]
+    event_sources: list[str]
+    event_types: list[str] = Field(
+        ...,
+        description=(
+            "Event key patterns matched with the same wildcard syntax a "
+            "trigger's 'on' field uses. Only sources publishing a known "
+            "catalog contribute; a custom webhook's keys come from its own "
+            "event_key_expr."
+        ),
+    )
+    triggers: TriggerCapabilities
+    features: list[str]
+
+
+class DraftValidationError(_SetupContractModel):
+    """A single problem with a draft, addressed to the field that caused it."""
+
+    field: str | None = Field(
+        ...,
+        description=(
+            "Dotted path into the draft, e.g. 'trigger.schedule' or "
+            "'repos[0].url'. Null when the problem spans the whole draft."
+        ),
+    )
+    code: str
+    message: str
+
+
+class ValidateDraftRequest(_SetupContractModel):
+    """Request to validate a draft automation without creating it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    endpoint: Literal["/v1", "/v1/preset/prompt", "/v1/preset/plugin"] = Field(
+        ...,
+        description=(
+            "Creation endpoint the draft will be sent to. '/v1' is the raw path, "
+            "which an entry shipping its own tarball uses."
+        ),
+    )
+    draft: dict[str, Any] = Field(
+        ..., description="The request body that would be sent to that endpoint"
+    )
+    automation_id: str | None = Field(
+        default=None,
+        max_length=255,
+        description="Catalog entry the draft came from, logged for correlation only",
+    )
+    sample_event: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Raw provider payload to test an event trigger against, as the "
+            "webhook endpoint would receive it."
+        ),
+    )
+
+
+class ValidateDraftResponse(_SetupContractModel):
+    """Outcome of validating a draft. An invalid draft is still a 200."""
+
+    valid: bool
+    errors: list[DraftValidationError] = Field(default_factory=list)
+    sample_event_matched: bool | None = Field(
+        default=None,
+        description=(
+            "Whether the sample event would fire this trigger. Null when no "
+            "sample event was supplied or the trigger is not event-based."
+        ),
+    )
