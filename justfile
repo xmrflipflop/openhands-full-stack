@@ -14,9 +14,10 @@ serve *args:
 
 # Kill background stack processes for this checkout.
 # Reads .dev-id and deletes dev-<id>/prod-<id> PM2 namespaces. Idempotent.
-# Pass --kill directly to the launcher; all other flags ignored.
+# Pass --stop directly to the launcher; all other flags ignored.
+# (--production --stop stops the prod stack of this id instead.)
 kill *args:
-    node scripts/launch-stack.js --kill {{args}}
+    node scripts/launch-stack.js --stop {{args}}
 
 # Bootstrap dependencies (run once per checkout).
 # Allocates .dev-id, runs uv sync + npm install.
@@ -27,6 +28,10 @@ kill *args:
 setup production="false" workspace_dir="":
     ./scripts/alloc-dev-id.sh
     cd packages/software-agent-sdk && uv sync
+    # automation keeps its own venv (packages/automation/.venv, gitignored);
+    # its openhands-sdk comes from PyPI at the version the package pins,
+    # while the agent-server runs the local SDK source from its own venv.
+    cd packages/automation && uv sync
     cd packages/OpenHands && npm install
     if [ "{{production}}" = "false" ]; then \
         echo "→ dev mode: ensuring upstream git remotes"; \
@@ -49,8 +54,10 @@ lint *args:
 setup-remotes:
     git remote add OpenHands https://github.com/OpenHands/OpenHands.git || git remote set-url OpenHands https://github.com/OpenHands/OpenHands.git
     git remote add software-agent-sdk https://github.com/OpenHands/software-agent-sdk.git || git remote set-url software-agent-sdk https://github.com/OpenHands/software-agent-sdk.git
+    git remote add automation https://github.com/OpenHands/automation.git || git remote set-url automation https://github.com/OpenHands/automation.git
     git config remote.software-agent-sdk.tagOpt --no-tags
     git config remote.OpenHands.tagOpt --no-tags
+    git config remote.automation.tagOpt --no-tags
     git remote -v
 
 # `repo` is the GitHub repository slug whose `releases/latest` resolves the
@@ -75,8 +82,11 @@ sync-sdk ref="latest": (sync-subtree "software-agent-sdk" ref)
 # Sync the OpenHands monorepo subtree (frontend root)
 sync-openhands ref="latest": (sync-subtree "OpenHands" ref)
 
+# Sync the OpenHands automation service subtree
+sync-automation ref="latest": (sync-subtree "automation" ref)
+
 # Sync subtree packages from upstream
-sync: sync-openhands sync-sdk
+sync: sync-openhands sync-sdk sync-automation
 
 # Install systemd service files
 install-service:

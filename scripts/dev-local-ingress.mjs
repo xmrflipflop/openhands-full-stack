@@ -29,6 +29,8 @@ import {
   createProxyHandlers,
   createRouter,
   isBenignSocketError,
+  isServerInfoRequest,
+  proxyServerInfoRequest,
 } from "../packages/OpenHands/scripts/proxy-utils.mjs";
 
 function parseArgs(argv) {
@@ -37,6 +39,10 @@ function parseArgs(argv) {
     host: "127.0.0.1",
     routes: {},
     defaultBackend: null,
+    // Read from a flag or the env var (matching upstream ingress.mjs). The env
+    // path is what the PM2 ecosystem uses, because a JSON blob with spaces
+    // must not be passed as a shell-joined `args` string.
+    runtimeServicesInfo: process.env.INGRESS_RUNTIME_SERVICES_INFO || null,
   };
 
   for (let i = 0; i < argv.length; i++) {
@@ -62,6 +68,9 @@ function parseArgs(argv) {
       case "-d":
       case "--default":
         config.defaultBackend = argv[++i];
+        break;
+      case "--runtime-services-info":
+        config.runtimeServicesInfo = argv[++i] || null;
         break;
       default:
         console.error(`Unknown option: ${argv[i]}`);
@@ -89,10 +98,23 @@ const proxy = createProxyHandlers({
 const uninstallDiagnostics = proxy.installDiagnostics();
 
 const server = createServer((req, res) => {
-  const backend = route(req.url ?? "/");
+  const url = req.url ?? "/";
+  const backend = route(url);
   if (!backend) {
     res.writeHead(503);
     res.end("No backend configured for this route");
+    return;
+  }
+  // Advertise the local services (agent-server, automation) to the frontend so
+  // it can render the <RUNTIME_SERVICES> block into agent system prompts.
+  // Mirrors the upstream ingress: proxy /server_info and append the
+  // runtime_services field. The router matched /server_info to the backend.
+  if (
+    config.runtimeServicesInfo &&
+    isServerInfoRequest(req) &&
+    (req.method === "GET" || req.method === "HEAD")
+  ) {
+    proxyServerInfoRequest(req, res, backend, config.runtimeServicesInfo);
     return;
   }
   proxy.proxyHttp(req, res, backend);

@@ -15,7 +15,7 @@
  *   - Parse flags (FR2).
  *   - Validate .dev-id: required for every checkout, incl. production;
  *     validate, never allocate (FR3).
- *   - Resolve ports: each of the six port flags defaults independently;
+ *   - Resolve ports: each of the eight port flags defaults independently;
  *     the computed default is base + id*10, plus 5 for production (FR5).
  *   - Compose the tag `dev-<id>` / `prod-<id>` (FR4), used verbatim as the
  *     app-name suffix, PM2 namespace, and log subdirectory.
@@ -33,7 +33,8 @@
  *
  * Usage:
  *   node scripts/launch-stack.js [--fe_port N] [--be_port N] \
- *     [--ingress_port N] [--fe_bind A] [--be_bind A] [--ingress_bind A] \
+ *     [--automation_port N] [--ingress_port N] [--fe_bind A] [--be_bind A] \
+ *     [--automation_bind A] [--ingress_bind A] \
  *     [--workspace_dir PATH] [--background] [--production] [--dry-run] [--stop]
  *
  * --workspace_dir: base directory for all agent-server data (conversations,
@@ -59,7 +60,7 @@ const LAUNCHER_PATH = __filename;
 // The launcher lives under scripts/, so the repo root is its parent.
 const REPO_ROOT = path.dirname(__dirname);
 
-const PORT_BASES = { fe: 3000, be: 18000, ingress: 9000 };
+const PORT_BASES = { fe: 3000, be: 18000, automation: 18100, ingress: 9000 };
 const PORT_STEP = 10; // id multiplier — MUST stay larger than PROD_PORT_OFFSET.
 const PROD_PORT_OFFSET = 5; // separates prod from dev of the same id.
 const PORT_MIN = 1024;
@@ -71,6 +72,29 @@ const CANVAS_BUILD_DIR = path.join(REPO_ROOT, "packages", "OpenHands", "build");
 const CANVAS_BUILD_INDEX = path.join(CANVAS_BUILD_DIR, "index.html");
 const ECOSYSTEM_FILE = path.join(REPO_ROOT, "ecosystem.config.js");
 const BUILD_CACHE_FILE = path.join(CANVAS_BUILD_DIR, ".build-cache.json");
+// Canonical builder for the runtime_services block the frontend injects into
+// agent system prompts (the <RUNTIME_SERVICES> section). Consumed, not
+// patched: the launcher builds the JSON and hands it to the ecosystem, which
+// passes it to the ingress app so /server_info advertises every local service
+// (agent-server, ingress, frontend, automation) to agents.
+const RUNTIME_SERVICES_BUILDER = path.join(
+  REPO_ROOT,
+  "packages",
+  "OpenHands",
+  "scripts",
+  "runtime-services-info.mjs",
+);
+function loadRuntimeServicesBuilder() {
+  const mod = require(RUNTIME_SERVICES_BUILDER);
+  const fn = mod.buildRuntimeServicesInfo ?? mod?.default?.buildRuntimeServicesInfo;
+  if (typeof fn !== "function") {
+    throw new Error(
+      `Could not load buildRuntimeServicesInfo from ${RUNTIME_SERVICES_BUILDER} ` +
+        "(runtime_services advertisement is unavailable).",
+    );
+  }
+  return fn;
+}
 
 const BUILD_COMMAND = "npm run build --prefix packages/OpenHands";
 
@@ -82,9 +106,11 @@ function parseCli(argv) {
     options: {
       fe_port: { type: "string", short: "F" },
       be_port: { type: "string", short: "B" },
+      automation_port: { type: "string", short: "A" },
       ingress_port: { type: "string", short: "I" },
       fe_bind: { type: "string" },
       be_bind: { type: "string" },
+      automation_bind: { type: "string" },
       ingress_bind: { type: "string" },
       workspace_dir: { type: "string" },
       background: { type: "boolean", default: false },
@@ -171,7 +197,7 @@ function validatePort(service, value, source) {
 
 /**
  * Resolve one service's port. The flag value wins; otherwise the formula
- * default is used (each of the six port flags defaults independently).
+ * default is used (each of the eight port flags defaults independently).
  */
 function resolvePort(service, flagValue, id, isProduction) {
   if (flagValue !== undefined) {
@@ -353,10 +379,12 @@ function resolve(values) {
 
   const fePort = resolvePort("fe", values.fe_port, id, isProduction);
   const bePort = resolvePort("be", values.be_port, id, isProduction);
+  const automationPort = resolvePort("automation", values.automation_port, id, isProduction);
   const ingressPort = resolvePort("ingress", values.ingress_port, id, isProduction);
 
   const feBind = resolveBind("fe", values.fe_bind);
   const beBind = resolveBind("be", values.be_bind);
+  const automationBind = resolveBind("automation", values.automation_bind);
   const ingressBind = resolveBind("ingress", values.ingress_bind);
 
   // Resolve workspace directory: flag -> env var -> default (repo_root/workspace)
@@ -364,6 +392,9 @@ function resolve(values) {
   let workspaceDir;
   let conversationsDir;
   let bashEventsDir;
+  let automationDbPath;
+  let automationStorageDir;
+  let automationWorkspaceDir;
   if (workspaceDirFlag !== undefined) {
     if (workspaceDirFlag === "") {
       throw new Error("Workspace directory cannot be empty");
@@ -379,6 +410,12 @@ function resolve(values) {
   }
   conversationsDir = path.join(workspaceDir, 'conversations');
   bashEventsDir = path.join(workspaceDir, 'bash_events');
+  // Automation service data, kept under the workspace dir like the other
+  // agent-server data: the SQLite DB file, the local file-store base
+  // (uploaded tarballs), and the base dir for per-run workspaces.
+  automationDbPath = path.join(workspaceDir, 'automation', 'automations.db');
+  automationStorageDir = path.join(workspaceDir, 'automation', 'storage');
+  automationWorkspaceDir = path.join(workspaceDir, 'automation', 'workspaces');
 
   // Resolve session API key using the workspace directory for persistence
   const sessionApiKey = resolveSessionApiKey(workspaceDir);
@@ -391,6 +428,30 @@ function resolve(values) {
   // env set (e.g., via `just setup --production`).
   const conversationWorkingDir = path.join(workspaceDir, 'project');
 
+  // Runtime-services advertisement (FR22): build the runtime_services block the
+  // frontend renders into agent system prompts, so agents know every local
+  // service (agent-server, ingress, frontend, automation) and how to reach the
+  // automation API. Uses the canonical upstream builder; the mode label and
+  // frontend kind mirror the reference agent-canvas launcher. Never fatal: if
+  // the builder can't be loaded the stack still starts (agents just don't get
+  // the advertisement).
+  let runtimeServicesInfo;
+  try {
+    runtimeServicesInfo = JSON.stringify(
+      loadRuntimeServicesBuilder()({
+        mode: `${isProduction ? "prod" : "dev"}:automation`,
+        agentServerPort: bePort,
+        ingressPort,
+        frontendPort: fePort,
+        frontendKind: isProduction ? "static" : "vite",
+        automation: { port: automationPort },
+      }),
+    );
+  } catch (err) {
+    console.error(`[run-stack] warning: runtime_services advertisement unavailable: ${err.message}`);
+    runtimeServicesInfo = undefined;
+  }
+
   // Foreground uses a throwaway PM2_HOME keyed on the tag so it never touches
   // the shared ~/.pm2 daemon. Background uses the shared daemon.
   const pm2Home = background ? undefined : `/tmp/pm2-fg-${tag}`;
@@ -400,9 +461,11 @@ function resolve(values) {
   return {
     fePort,
     bePort,
+    automationPort,
     ingressPort,
     feBind,
     beBind,
+    automationBind,
     ingressBind,
     tag,
     namespace: tag,
@@ -415,7 +478,11 @@ function resolve(values) {
     workspaceDir,
     conversationsDir,
     bashEventsDir,
+    automationDbPath,
+    automationStorageDir,
+    automationWorkspaceDir,
     conversationWorkingDir,
+    runtimeServicesInfo,
   };
 }
 
@@ -428,18 +495,49 @@ function buildStackEnv(r) {
   return {
     STACK_FE_PORT: String(r.fePort),
     STACK_BE_PORT: String(r.bePort),
+    STACK_AUTOMATION_PORT: String(r.automationPort),
     STACK_INGRESS_PORT: String(r.ingressPort),
     STACK_FE_BIND: r.feBind,
     STACK_BE_BIND: r.beBind,
+    STACK_AUTOMATION_BIND: r.automationBind,
     STACK_INGRESS_BIND: r.ingressBind,
     STACK_TAG: r.tag,
     STACK_SESSION_API_KEY: r.sessionApiKey,
     STACK_WORKSPACE_DIR: r.workspaceDir,
     STACK_CONVERSATIONS_DIR: r.conversationsDir,
     STACK_BASH_EVENTS_DIR: r.bashEventsDir,
+    STACK_AUTOMATION_DB: r.automationDbPath,
+    STACK_AUTOMATION_STORAGE_DIR: r.automationStorageDir,
+    STACK_AUTOMATION_WORKSPACE_DIR: r.automationWorkspaceDir,
     STACK_VITE_WORKING_DIR: r.conversationWorkingDir,
+    STACK_RUNTIME_SERVICES_INFO: r.runtimeServicesInfo ?? "",
     NODE_ENV: r.nodeEnv,
   };
+}
+
+/**
+ * Create the on-disk data directories the stack's services write to.
+ *
+ * `resolve()` stays pure (NFR6) and only *computes* these paths; this is the
+ * single place the launcher materialises them. It runs only for real launches
+ * (never on `--dry-run`). The automation SQLite DB is the hard dependency:
+ * SQLite will not create its own parent directory, so a fresh checkout would
+ * crash the automation app's migration step without this. The agent-server
+ * creates its own conversations/bash_events dirs, and the automation storage
+ * dir self-creates, but we create all of these up front so the services never
+ * have to race to build them.
+ */
+function createRuntimeDirs(r) {
+  const dirs = [
+    path.dirname(r.automationDbPath),
+    r.automationStorageDir,
+    r.automationWorkspaceDir,
+    r.conversationsDir,
+    r.bashEventsDir,
+  ];
+  for (const dir of dirs) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
 }
 
 // ── Spawning ─────────────────────────────────────────────────────────────────
@@ -545,7 +643,8 @@ function main() {
     console.error(`[run-stack] flag error: ${err.message}`);
     console.error(
       `Usage: node scripts/launch-stack.js [--fe_port N] [--be_port N] ` +
-        `[--ingress_port N] [--fe_bind A] [--be_bind A] [--ingress_bind A] ` +
+        `[--automation_port N] [--ingress_port N] [--fe_bind A] [--be_bind A] ` +
+        `[--automation_bind A] [--ingress_bind A] ` +
         `[--workspace_dir PATH] [--background] [--production] [--dry-run] [--stop]`,
     );
     process.exit(2);
@@ -578,6 +677,7 @@ function main() {
   }
 
   console.error(describeLaunch(r));
+  createRuntimeDirs(r);
   spawnPm2(r);
 
   if (r.background) {

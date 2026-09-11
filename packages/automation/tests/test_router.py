@@ -1,0 +1,3593 @@
+"""Tests for API router endpoints."""
+
+import io
+import tarfile
+import uuid
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+from sqlalchemy import select
+
+from openhands.automation.models import (
+    Automation,
+    AutomationDisableEvent,
+    AutomationRun,
+    TarballUpload,
+    UploadStatus,
+)
+from openhands.automation.preset_router import _build_storage_path, _generate_tarball
+from openhands.automation.storage import ObjectNotFoundError
+from openhands.automation.utils import utcnow
+from openhands.automation.utils.tarball_validation import (
+    build_internal_url,
+    parse_internal_upload_id,
+)
+
+
+# Test UUIDs matching mock_authenticated_user fixture
+TEST_USER_ID = uuid.UUID("12345678-1234-5678-1234-567812345678")
+TEST_ORG_ID = uuid.UUID("87654321-4321-8765-4321-876543218765")
+OTHER_USER_ID = uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+OTHER_ORG_ID = uuid.UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+
+
+@pytest.fixture
+def local_mode(monkeypatch):
+    """Force local mode for tests asserting on a browser-supplied distinct id.
+
+    Cloud must derive telemetry identity from auth, so
+    `telemetry._trusted_telemetry_context()` discards the header outside local
+    mode and the assertion only holds inside it. The config is cached, so it
+    has to be cleared on the way in and on the way out; without this the tests
+    happen to pass only when an earlier test file leaves a local-mode config in
+    the cache, and fail whenever they run first.
+    """
+    from openhands.automation.config import clear_config_cache
+
+    monkeypatch.setenv("AUTOMATION_AGENT_SERVER_URL", "http://localhost:3000")
+    clear_config_cache()
+    yield
+    clear_config_cache()
+
+
+@pytest.fixture
+def preset_store(monkeypatch):
+    """Stateful in-memory file store wired into the preset tarball helpers.
+
+    The PATCH handler resolves the file store lazily via
+    ``preset_router.get_file_store`` only when regenerating a preset tarball, so
+    tests patch that name rather than overriding a FastAPI dependency.
+    """
+    from collections.abc import AsyncIterator
+
+    from openhands.automation import preset_router
+
+    store = MagicMock()
+    store._storage = {}
+
+    async def _write_stream(
+        path: str,
+        stream: AsyncIterator[bytes],
+        max_size: int | None = None,
+        content_type: str = "application/octet-stream",
+    ) -> int:
+        content = b""
+        async for chunk in stream:
+            content += chunk
+        store._storage[path] = content
+        return len(content)
+
+    store.write_stream = AsyncMock(side_effect=_write_stream)
+    store.read = MagicMock(side_effect=lambda path: store._storage[path])
+    store.delete = MagicMock(side_effect=lambda path: store._storage.pop(path, None))
+    monkeypatch.setattr(preset_router, "get_file_store", lambda: store)
+    return store
+
+
+async def _seed_prompt_preset_automation(async_session, store, prompt):
+    """Insert a prompt-preset automation whose internal tarball bakes ``prompt``."""
+    upload_id = uuid.uuid4()
+    storage_path = _build_storage_path(TEST_ORG_ID, TEST_USER_ID, upload_id)
+    store._storage[storage_path] = _generate_tarball(prompt)
+
+    async_session.add(
+        TarballUpload(
+            id=upload_id,
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="seed-upload",
+            status=UploadStatus.COMPLETED,
+            storage_path=storage_path,
+        )
+    )
+    automation = Automation(
+        user_id=TEST_USER_ID,
+        org_id=TEST_ORG_ID,
+        name="Preset Automation",
+        prompt=prompt,
+        trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+        tarball_path=build_internal_url(upload_id),
+        setup_script_path="setup.sh",
+        entrypoint=".venv/bin/python main.py",
+    )
+    async_session.add(automation)
+    await async_session.commit()
+    return automation
+
+
+@pytest.fixture
+def _automation_for_permission_tests(async_session):
+    """Create an automation owned by the test user for permission tests."""
+
+    async def _create():
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Permission Test Automation",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/code.tar.gz",
+            entrypoint="uv run script.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+        return automation
+
+    return _create
+
+
+class TestPermissionEnforcement:
+    """Tests for permission enforcement on mutating endpoints.
+
+    With the split permission model, write endpoints on a specific automation
+    require either ``manage_automations`` (admins/owners) OR that the caller is
+    the automation's creator.  The ``readonly_client`` fixture is a member with
+    ``view_automations`` only, so it must be the *non-creator* to get a 403.
+    """
+
+    _OTHER_USER_ID = uuid.UUID("99999999-9999-9999-9999-999999999999")
+
+    async def test_update_without_permission_returns_403(
+        self, readonly_client, async_session
+    ):
+        """PATCH returns 403 when a non-creator member tries to update."""
+        automation = Automation(
+            user_id=self._OTHER_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Test",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/code.tar.gz",
+            entrypoint="uv run script.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        response = await readonly_client.patch(
+            f"/api/automation/v1/{automation.id}",
+            json={"name": "Updated"},
+        )
+
+        assert response.status_code == 403
+        assert "manage_automations" not in response.json()["detail"]
+
+    async def test_delete_without_permission_returns_403(
+        self, readonly_client, async_session
+    ):
+        """DELETE returns 403 when a non-creator member tries to delete."""
+        automation = Automation(
+            user_id=self._OTHER_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Test",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/code.tar.gz",
+            entrypoint="uv run script.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        response = await readonly_client.delete(f"/api/automation/v1/{automation.id}")
+
+        assert response.status_code == 403
+        assert "manage_automations" not in response.json()["detail"]
+
+    async def test_update_as_creator_succeeds(self, readonly_client, async_session):
+        """A member who is the automation creator can update their own automation."""
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Test",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/code.tar.gz",
+            entrypoint="uv run script.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        response = await readonly_client.patch(
+            f"/api/automation/v1/{automation.id}",
+            json={"name": "Updated by creator"},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["name"] == "Updated by creator"
+
+    async def test_delete_as_creator_succeeds(self, readonly_client, async_session):
+        """A member who is the automation creator can delete their own automation."""
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Test",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/code.tar.gz",
+            entrypoint="uv run script.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        response = await readonly_client.delete(f"/api/automation/v1/{automation.id}")
+
+        assert response.status_code == 204
+
+    async def _other_users_automation(
+        self, async_session, *, enabled: bool = True
+    ) -> Automation:
+        """Persist an automation created by someone other than the caller."""
+        automation = Automation(
+            user_id=self._OTHER_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Teammate Automation",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/code.tar.gz",
+            entrypoint="uv run script.py",
+            enabled=enabled,
+        )
+        async_session.add(automation)
+        await async_session.commit()
+        return automation
+
+    async def test_update_as_non_creator_manager_returns_403(
+        self, async_client, async_session
+    ):
+        """A manager cannot edit another user's automation definition."""
+        # Arrange
+        automation = await self._other_users_automation(async_session)
+
+        # Act
+        response = await async_client.patch(
+            f"/api/automation/v1/{automation.id}",
+            json={"prompt": "Do something else"},
+        )
+
+        # Assert
+        assert response.status_code == 403
+        assert "creator" in response.json()["detail"]
+
+    async def test_disable_as_non_creator_manager_succeeds(
+        self, async_client, async_session
+    ):
+        """A manager can turn off another user's automation."""
+        # Arrange
+        automation = await self._other_users_automation(async_session, enabled=True)
+
+        # Act
+        response = await async_client.patch(
+            f"/api/automation/v1/{automation.id}", json={"enabled": False}
+        )
+
+        # Assert
+        assert response.status_code == 200
+        assert response.json()["enabled"] is False
+
+    async def test_enable_as_non_creator_manager_returns_403(
+        self, async_client, async_session
+    ):
+        """A manager cannot turn another user's automation back on."""
+        # Arrange
+        automation = await self._other_users_automation(async_session, enabled=False)
+
+        # Act
+        response = await async_client.patch(
+            f"/api/automation/v1/{automation.id}", json={"enabled": True}
+        )
+
+        # Assert
+        assert response.status_code == 403
+
+    async def test_disable_with_edits_as_non_creator_manager_returns_403(
+        self, async_client, async_session
+    ):
+        """Turning off cannot carry other edits along with it."""
+        # Arrange
+        automation = await self._other_users_automation(async_session)
+
+        # Act
+        response = await async_client.patch(
+            f"/api/automation/v1/{automation.id}",
+            json={"enabled": False, "name": "Renamed"},
+        )
+
+        # Assert
+        assert response.status_code == 403
+
+
+class TestCreateAutomation:
+    """Tests for POST /v1 endpoint."""
+
+    async def test_create_automation_success(
+        self, async_client, async_session, local_mode
+    ):
+        """Valid request creates automation and returns 201."""
+        payload = {
+            "name": "My Test Automation",
+            "trigger": {"type": "cron", "schedule": "0 9 * * 5", "timezone": "UTC"},
+            "tarball_path": "s3://bucket/path/to/code.tar.gz",
+            "setup_script_path": "setup.sh",
+            "entrypoint": "uv run script.py",
+        }
+
+        response = await async_client.post(
+            "/api/automation/v1",
+            json=payload,
+            headers={"X-OpenHands-Telemetry-Distinct-Id": "ph-fe-creator"},
+        )
+
+        assert response.status_code == 201
+        data = response.json()
+        assert data["name"] == "My Test Automation"
+        assert data["trigger"] == {
+            "type": "cron",
+            "schedule": "0 9 * * 5",
+            "timezone": "UTC",
+        }
+        assert data["tarball_path"] == "s3://bucket/path/to/code.tar.gz"
+        assert data["setup_script_path"] == "setup.sh"
+        assert data["entrypoint"] == "uv run script.py"
+        assert data["keep_alive"] is None
+        assert data["enabled"] is True
+        assert "id" in data
+        assert data["user_id"] == str(TEST_USER_ID)
+        automation = await async_session.get(Automation, uuid.UUID(data["id"]))
+        assert automation is not None
+        assert automation.telemetry_distinct_id == "ph-fe-creator"
+
+    async def test_create_automation_preset_metadata_is_null(self, async_client):
+        """Custom SDK automations are created without preset metadata."""
+        payload = {
+            "name": "My Test Automation",
+            "trigger": {"type": "cron", "schedule": "0 9 * * 5", "timezone": "UTC"},
+            "tarball_path": "s3://bucket/path/to/code.tar.gz",
+            "entrypoint": "uv run script.py",
+        }
+
+        response = await async_client.post("/api/automation/v1", json=payload)
+
+        assert response.status_code == 201
+        assert response.json()["preset_metadata"] is None
+
+    async def test_create_automation_stores_template_provenance(self, async_client):
+        """A catalog entry shipping its own tarball records where it came from."""
+        payload = {
+            "name": "PR Reviewer Bundle",
+            "trigger": {"type": "cron", "schedule": "*/5 * * * *"},
+            "tarball_path": "s3://bucket/path/to/bundle.tar.gz",
+            "entrypoint": "uv run main.py",
+            "template": {
+                "id": "github-pr-reviewer",
+                "version": "1.2.0",
+                "config": {"repos": ["OpenHands/automation"]},
+            },
+        }
+
+        response = await async_client.post("/api/automation/v1", json=payload)
+
+        assert response.status_code == 201
+        assert response.json()["preset_metadata"] == {
+            "template": {
+                "id": "github-pr-reviewer",
+                "version": "1.2.0",
+                "config": {"repos": ["OpenHands/automation"]},
+            }
+        }
+
+    async def test_create_automation_with_known_template_returns_existing(
+        self, async_client
+    ):
+        """Enabling the same bundle twice returns the first automation, 200."""
+        payload = {
+            "name": "PR Reviewer Bundle",
+            "trigger": {"type": "cron", "schedule": "*/5 * * * *"},
+            "tarball_path": "s3://bucket/path/to/bundle.tar.gz",
+            "entrypoint": "uv run main.py",
+            "template": {"id": "github-pr-reviewer", "version": "1.2.0"},
+        }
+        first = await async_client.post("/api/automation/v1", json=payload)
+        assert first.status_code == 201
+
+        second = await async_client.post("/api/automation/v1", json=payload)
+
+        assert second.status_code == 200
+        assert second.json()["id"] == first.json()["id"]
+        listing = await async_client.get("/api/automation/v1")
+        assert listing.json()["total"] == 1
+
+    async def test_create_automation_shares_template_identity_with_presets(
+        self, async_client
+    ):
+        """A template enabled as a preset is not enabled again as a bundle."""
+        first = await async_client.post(
+            "/api/automation/v1/preset/prompt",
+            json={
+                "name": "Reviewer",
+                "prompt": "Review open pull requests.",
+                "trigger": {"type": "cron", "schedule": "*/5 * * * *"},
+                "template": {"id": "shared-entry", "version": "1.0.0"},
+            },
+        )
+        assert first.status_code == 201
+
+        second = await async_client.post(
+            "/api/automation/v1",
+            json={
+                "name": "Reviewer Bundle",
+                "trigger": {"type": "cron", "schedule": "*/5 * * * *"},
+                "tarball_path": "s3://bucket/path/to/bundle.tar.gz",
+                "entrypoint": "uv run main.py",
+                "template": {"id": "shared-entry", "version": "2.0.0"},
+            },
+        )
+
+        assert second.status_code == 200
+        assert second.json()["id"] == first.json()["id"]
+
+    async def test_deleted_bundle_automation_does_not_block_reenabling(
+        self, async_client
+    ):
+        """After deleting a bundle automation, the entry can be enabled again."""
+        payload = {
+            "name": "Recreate Me",
+            "trigger": {"type": "cron", "schedule": "*/5 * * * *"},
+            "tarball_path": "s3://bucket/path/to/bundle.tar.gz",
+            "entrypoint": "uv run main.py",
+            "template": {"id": "github-pr-reviewer", "version": "1.2.0"},
+        }
+        first = await async_client.post("/api/automation/v1", json=payload)
+        deleted = await async_client.delete(f"/api/automation/v1/{first.json()['id']}")
+        assert deleted.status_code == 204
+
+        second = await async_client.post("/api/automation/v1", json=payload)
+
+        assert second.status_code == 201
+        assert second.json()["id"] != first.json()["id"]
+
+    async def test_create_automation_rejects_oversized_template_config(
+        self, async_client
+    ):
+        """A template config over the serialized-size cap is a validation error."""
+        payload = {
+            "name": "Oversized Config",
+            "trigger": {"type": "cron", "schedule": "*/5 * * * *"},
+            "tarball_path": "s3://bucket/path/to/bundle.tar.gz",
+            "entrypoint": "uv run main.py",
+            "template": {
+                "id": "big-entry",
+                "version": "1.0.0",
+                "config": {"blob": "x" * 20_000},
+            },
+        }
+
+        response = await async_client.post("/api/automation/v1", json=payload)
+
+        assert response.status_code == 422
+
+    async def test_create_automation_defaults_to_active_model_profile(
+        self, async_client, mock_authenticated_user
+    ):
+        """Create stores the active model profile when none is requested."""
+        mock_authenticated_user.model_profile_names = frozenset({"active-profile"})
+        mock_authenticated_user.active_model_profile_name = "active-profile"
+
+        response = await async_client.post(
+            "/api/automation/v1",
+            json={
+                "name": "My Test Automation",
+                "trigger": {"type": "cron", "schedule": "0 9 * * 5"},
+                "tarball_path": "s3://bucket/path/to/code.tar.gz",
+                "entrypoint": "uv run script.py",
+            },
+        )
+
+        assert response.status_code == 201
+        assert response.json()["model"] == "active-profile"
+
+    async def test_create_automation_without_setup_script(self, async_client):
+        """Automation can be created without setup_script_path."""
+        payload = {
+            "name": "No Setup Script",
+            "trigger": {"type": "cron", "schedule": "0 9 * * *"},
+            "tarball_path": "s3://bucket/path/to/code.tar.gz",
+            "entrypoint": "python main.py",
+        }
+
+        response = await async_client.post("/api/automation/v1", json=payload)
+
+        assert response.status_code == 201
+        data = response.json()
+        assert data["setup_script_path"] is None
+        assert data["entrypoint"] == "python main.py"
+
+    async def test_create_automation_invalid_cron(self, async_client):
+        """Invalid cron expression returns 422."""
+        payload = {
+            "name": "Bad Cron",
+            "trigger": {"type": "cron", "schedule": "invalid-cron", "timezone": "UTC"},
+            "tarball_path": "s3://bucket/path/to/code.tar.gz",
+            "entrypoint": "uv run script.py",
+        }
+
+        response = await async_client.post("/api/automation/v1", json=payload)
+
+        assert response.status_code == 422
+        detail = response.json()["detail"]
+        # Discriminated union includes the tag name ("cron") in the path
+        schedule_errors = [
+            e for e in detail if e["loc"] == ["body", "trigger", "cron", "schedule"]
+        ]
+        assert len(schedule_errors) == 1
+        assert "Invalid cron expression" in schedule_errors[0]["msg"]
+
+    async def test_create_automation_impossible_cron(self, async_client):
+        """Cron expressions that can never fire return 422."""
+        payload = {
+            "name": "Impossible Cron",
+            "trigger": {"type": "cron", "schedule": "0 0 31 2 *", "timezone": "UTC"},
+            "tarball_path": "s3://bucket/path/to/code.tar.gz",
+            "entrypoint": "uv run script.py",
+        }
+
+        response = await async_client.post("/api/automation/v1", json=payload)
+
+        assert response.status_code == 422
+        detail = response.json()["detail"]
+        schedule_errors = [
+            e for e in detail if e["loc"] == ["body", "trigger", "cron", "schedule"]
+        ]
+        assert len(schedule_errors) == 1
+        assert "cannot produce any future fire times" in schedule_errors[0]["msg"]
+
+    async def test_create_automation_invalid_timezone(self, async_client):
+        """Invalid timezone names return 422."""
+        payload = {
+            "name": "Bad Timezone",
+            "trigger": {
+                "type": "cron",
+                "schedule": "0 9 * * *",
+                "timezone": "Not/A_Timezone",
+            },
+            "tarball_path": "s3://bucket/path/to/code.tar.gz",
+            "entrypoint": "uv run script.py",
+        }
+
+        response = await async_client.post("/api/automation/v1", json=payload)
+
+        assert response.status_code == 422
+        detail = response.json()["detail"]
+        timezone_errors = [
+            e for e in detail if e["loc"] == ["body", "trigger", "cron", "timezone"]
+        ]
+        assert len(timezone_errors) == 1
+        assert "Invalid timezone" in timezone_errors[0]["msg"]
+
+    async def test_create_automation_missing_fields(self, async_client):
+        """Missing required fields returns 422."""
+        payload = {"name": "Incomplete"}
+
+        response = await async_client.post("/api/automation/v1", json=payload)
+
+        assert response.status_code == 422
+
+    async def test_create_automation_missing_entrypoint(self, async_client):
+        """Missing entrypoint returns 422."""
+        payload = {
+            "name": "No Entrypoint",
+            "trigger": {"type": "cron", "schedule": "0 9 * * *"},
+            "tarball_path": "s3://bucket/path/to/code.tar.gz",
+        }
+
+        response = await async_client.post("/api/automation/v1", json=payload)
+
+        assert response.status_code == 422
+
+    async def test_create_automation_invalid_tarball_path(self, async_client):
+        """tarball_path without valid scheme returns 422."""
+        payload = {
+            "name": "Bad Path",
+            "trigger": {"type": "cron", "schedule": "0 9 * * *"},
+            "tarball_path": "/local/path/code.tar.gz",
+            "entrypoint": "uv run main.py",
+        }
+
+        response = await async_client.post("/api/automation/v1", json=payload)
+
+        assert response.status_code == 422
+        assert any(
+            "tarball_path" in str(e.get("loc", [])) for e in response.json()["detail"]
+        )
+
+    async def test_create_automation_internal_upload_scheme_accepted(
+        self, async_client
+    ):
+        """oh-internal:// scheme is accepted by schema validation."""
+        payload = {
+            "name": "Internal Upload Test",
+            "trigger": {"type": "cron", "schedule": "0 9 * * *"},
+            "tarball_path": "oh-internal://uploads/12345678-1234-1234-1234-123456789abc",
+            "entrypoint": "uv run main.py",
+        }
+
+        response = await async_client.post("/api/automation/v1", json=payload)
+
+        # Should pass schema validation (422 would mean schema rejected it)
+        # Will get 404 because the upload doesn't exist, but that's fine -
+        # we're testing schema validation, not upload validation
+        assert response.status_code == 404
+
+    async def test_create_automation_entrypoint_shell_metachar(self, async_client):
+        """entrypoint with shell metacharacters returns 422."""
+        payload = {
+            "name": "Shell Injection",
+            "trigger": {"type": "cron", "schedule": "0 9 * * *"},
+            "tarball_path": "s3://bucket/code.tar.gz",
+            "entrypoint": "uv run main.py; rm -rf /",
+        }
+
+        response = await async_client.post("/api/automation/v1", json=payload)
+
+        assert response.status_code == 422
+
+    async def test_create_automation_entrypoint_absolute_path(self, async_client):
+        """entrypoint with absolute path returns 422."""
+        payload = {
+            "name": "Absolute Path",
+            "trigger": {"type": "cron", "schedule": "0 9 * * *"},
+            "tarball_path": "s3://bucket/code.tar.gz",
+            "entrypoint": "/usr/bin/python main.py",
+        }
+
+        response = await async_client.post("/api/automation/v1", json=payload)
+
+        assert response.status_code == 422
+
+    async def test_create_automation_setup_script_path_traversal(self, async_client):
+        """setup_script_path with path traversal returns 422."""
+        payload = {
+            "name": "Path Traversal",
+            "trigger": {"type": "cron", "schedule": "0 9 * * *"},
+            "tarball_path": "s3://bucket/code.tar.gz",
+            "setup_script_path": "../../etc/shadow",
+            "entrypoint": "uv run main.py",
+        }
+
+        response = await async_client.post("/api/automation/v1", json=payload)
+
+        assert response.status_code == 422
+
+    async def test_create_automation_setup_script_absolute_path(self, async_client):
+        """setup_script_path with absolute path returns 422."""
+        payload = {
+            "name": "Absolute Setup",
+            "trigger": {"type": "cron", "schedule": "0 9 * * *"},
+            "tarball_path": "s3://bucket/code.tar.gz",
+            "setup_script_path": "/etc/cron.d/backdoor",
+            "entrypoint": "uv run main.py",
+        }
+
+        response = await async_client.post("/api/automation/v1", json=payload)
+
+        assert response.status_code == 422
+
+    async def test_create_automation_setup_script_shell_metachar(self, async_client):
+        """setup_script_path with shell metacharacters returns 422."""
+        payload = {
+            "name": "Shell Metachar Setup",
+            "trigger": {"type": "cron", "schedule": "0 9 * * *"},
+            "tarball_path": "s3://bucket/code.tar.gz",
+            "setup_script_path": "setup.sh; rm -rf /",
+            "entrypoint": "uv run main.py",
+        }
+
+        response = await async_client.post("/api/automation/v1", json=payload)
+
+        assert response.status_code == 422
+
+    async def test_create_automation_setup_script_valid(self, async_client):
+        """Valid setup_script_path is accepted."""
+        payload = {
+            "name": "Valid Setup",
+            "trigger": {"type": "cron", "schedule": "0 9 * * *"},
+            "tarball_path": "s3://bucket/code.tar.gz",
+            "setup_script_path": "scripts/setup.sh",
+            "entrypoint": "uv run main.py",
+        }
+
+        response = await async_client.post("/api/automation/v1", json=payload)
+
+        assert response.status_code == 201
+        assert response.json()["setup_script_path"] == "scripts/setup.sh"
+
+    async def test_create_automation_with_timeout(self, async_client):
+        """Automation can be created with a valid timeout above the default."""
+        payload = {
+            "name": "With Timeout",
+            "trigger": {"type": "cron", "schedule": "0 9 * * *"},
+            "tarball_path": "s3://bucket/code.tar.gz",
+            "entrypoint": "python main.py",
+            "timeout": 1200,
+        }
+
+        response = await async_client.post("/api/automation/v1", json=payload)
+
+        assert response.status_code == 201
+        data = response.json()
+        assert data["timeout"] == 1200
+
+    async def test_create_automation_without_timeout(self, async_client):
+        """Automation can be created without timeout (uses system default)."""
+        payload = {
+            "name": "No Timeout",
+            "trigger": {"type": "cron", "schedule": "0 9 * * *"},
+            "tarball_path": "s3://bucket/code.tar.gz",
+            "entrypoint": "python main.py",
+        }
+
+        response = await async_client.post("/api/automation/v1", json=payload)
+
+        assert response.status_code == 201
+        data = response.json()
+        assert data["timeout"] == 600
+
+    async def test_create_automation_with_keep_alive_false(self, async_client):
+        """Automation can opt into explicit sandbox cleanup."""
+        payload = {
+            "name": "Immediate Cleanup",
+            "trigger": {"type": "cron", "schedule": "0 9 * * *"},
+            "tarball_path": "s3://bucket/code.tar.gz",
+            "entrypoint": "python main.py",
+            "keep_alive": False,
+        }
+
+        response = await async_client.post("/api/automation/v1", json=payload)
+
+        assert response.status_code == 201
+        assert response.json()["keep_alive"] is False
+
+    async def test_create_automation_invalid_keep_alive_rejected(self, async_client):
+        """Invalid keep_alive value returns 422."""
+        payload = {
+            "name": "Bad Keep Alive",
+            "trigger": {"type": "cron", "schedule": "0 9 * * *"},
+            "tarball_path": "s3://bucket/code.tar.gz",
+            "entrypoint": "python main.py",
+            "keep_alive": "not-a-bool",
+        }
+
+        response = await async_client.post("/api/automation/v1", json=payload)
+
+        assert response.status_code == 422
+
+    async def test_create_automation_timeout_zero_rejected(self, async_client):
+        """Timeout of zero is rejected."""
+        payload = {
+            "name": "Zero Timeout",
+            "trigger": {"type": "cron", "schedule": "0 9 * * *"},
+            "tarball_path": "s3://bucket/code.tar.gz",
+            "entrypoint": "python main.py",
+            "timeout": 0,
+        }
+
+        response = await async_client.post("/api/automation/v1", json=payload)
+
+        assert response.status_code == 422
+
+    async def test_create_automation_timeout_negative_rejected(self, async_client):
+        """Negative timeout is rejected."""
+        payload = {
+            "name": "Negative Timeout",
+            "trigger": {"type": "cron", "schedule": "0 9 * * *"},
+            "tarball_path": "s3://bucket/code.tar.gz",
+            "entrypoint": "python main.py",
+            "timeout": -100,
+        }
+
+        response = await async_client.post("/api/automation/v1", json=payload)
+
+        assert response.status_code == 422
+
+    async def test_create_automation_timeout_exceeds_max_rejected(self, async_client):
+        """Timeout exceeding the 30-minute user maximum is rejected."""
+        payload = {
+            "name": "Too Long Timeout",
+            "trigger": {"type": "cron", "schedule": "0 9 * * *"},
+            "tarball_path": "s3://bucket/code.tar.gz",
+            "entrypoint": "python main.py",
+            "timeout": 1801,  # 30-minute maximum is 1800 seconds
+        }
+
+        response = await async_client.post("/api/automation/v1", json=payload)
+
+        assert response.status_code == 422
+
+    async def test_create_automation_timeout_at_max_allowed(self, async_client):
+        """Timeout at exactly the 30-minute maximum is allowed."""
+        payload = {
+            "name": "Max Timeout",
+            "trigger": {"type": "cron", "schedule": "0 9 * * *"},
+            "tarball_path": "s3://bucket/code.tar.gz",
+            "entrypoint": "python main.py",
+            "timeout": 1800,
+        }
+
+        response = await async_client.post("/api/automation/v1", json=payload)
+
+        assert response.status_code == 201
+        data = response.json()
+        assert data["timeout"] == 1800
+
+
+class TestListAutomations:
+    """Tests for GET /v1 endpoint."""
+
+    async def test_list_automations_empty(self, async_client):
+        """No automations returns empty list."""
+        response = await async_client.get("/api/automation/v1")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["automations"] == []
+        assert data["total"] == 0
+
+    async def test_list_automations_returns_own(self, async_client, async_session):
+        """Returns automations for authenticated user."""
+        # Create an automation for the test user
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Test Automation",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/path/to/code.tar.gz",
+            entrypoint="uv run script.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        response = await async_client.get("/api/automation/v1")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data["automations"]) == 1
+        assert data["total"] == 1
+        assert data["automations"][0]["name"] == "Test Automation"
+
+    async def test_list_automations_includes_other_org_members(
+        self, async_client, async_session
+    ):
+        """Automations owned by another member of the caller's org are listed."""
+        automation = Automation(
+            user_id=OTHER_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Teammate Automation",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/path/to/code.tar.gz",
+            entrypoint="uv run script.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        response = await async_client.get("/api/automation/v1")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["total"] == 1
+        assert data["automations"][0]["name"] == "Teammate Automation"
+
+    async def test_list_automations_excludes_deleted(self, async_client, async_session):
+        """Soft-deleted automations are not returned."""
+        # Create a deleted automation
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Deleted Automation",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/path/to/code.tar.gz",
+            entrypoint="uv run script.py",
+            deleted_at=utcnow(),
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        response = await async_client.get("/api/automation/v1")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["automations"] == []
+        assert data["total"] == 0
+
+    async def test_list_automations_cross_org_returns_empty(
+        self, async_client, async_session
+    ):
+        """Automations from another organization are not visible."""
+        automation = Automation(
+            user_id=OTHER_USER_ID,
+            org_id=OTHER_ORG_ID,
+            name="Other Org Automation",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/path/to/code.tar.gz",
+            entrypoint="uv run script.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        response = await async_client.get("/api/automation/v1")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["automations"] == []
+        assert data["total"] == 0
+
+    async def test_list_automations_pagination(self, async_client, async_session):
+        """Pagination parameters work correctly."""
+        # Create multiple automations
+        for i in range(5):
+            automation = Automation(
+                user_id=TEST_USER_ID,
+                org_id=TEST_ORG_ID,
+                name=f"Automation {i}",
+                trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+                tarball_path="s3://bucket/path/to/code.tar.gz",
+                entrypoint="uv run script.py",
+            )
+            async_session.add(automation)
+        await async_session.commit()
+
+        response = await async_client.get("/api/automation/v1?limit=2&offset=0")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data["automations"]) == 2
+        assert data["total"] == 5
+
+
+class TestGetAutomation:
+    """Tests for GET /v1/{id} endpoint."""
+
+    async def test_get_automation_success(self, async_client, async_session):
+        """Valid ID returns automation."""
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Test Automation",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/path/to/code.tar.gz",
+            entrypoint="uv run script.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        response = await async_client.get(f"/api/automation/v1/{automation.id}")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["name"] == "Test Automation"
+        assert data["id"] == str(automation.id)
+
+    async def test_get_automation_returns_prompt(self, async_client, async_session):
+        """GET returns prompt field when set."""
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Prompt Automation",
+            prompt="Summarize PRs daily",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/code.tar.gz",
+            entrypoint="python main.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        response = await async_client.get(f"/api/automation/v1/{automation.id}")
+
+        assert response.status_code == 200
+        assert response.json()["prompt"] == "Summarize PRs daily"
+
+    async def test_get_automation_without_prompt_returns_null(
+        self, async_client, async_session
+    ):
+        """GET returns null prompt when not set."""
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="No Prompt Automation",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/code.tar.gz",
+            entrypoint="python main.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        response = await async_client.get(f"/api/automation/v1/{automation.id}")
+
+        assert response.status_code == 200
+        assert response.json()["prompt"] is None
+
+    async def test_get_automation_not_found(self, async_client):
+        """Invalid ID returns 404."""
+        fake_id = uuid.uuid4()
+
+        response = await async_client.get(f"/api/automation/v1/{fake_id}")
+
+        assert response.status_code == 404
+        assert "Automation not found" in response.json()["detail"]
+
+    async def test_get_automation_deleted(self, async_client, async_session):
+        """Soft-deleted automation returns 404."""
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Deleted Automation",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/path/to/code.tar.gz",
+            entrypoint="uv run script.py",
+            deleted_at=utcnow(),
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        response = await async_client.get(f"/api/automation/v1/{automation.id}")
+
+        assert response.status_code == 404
+
+    async def test_get_automation_cross_org_returns_404(
+        self, async_client, async_session
+    ):
+        """Cannot access automation from another organization."""
+        automation = Automation(
+            user_id=OTHER_USER_ID,
+            org_id=OTHER_ORG_ID,
+            name="Other Org Automation",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/path/to/code.tar.gz",
+            entrypoint="uv run script.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        response = await async_client.get(f"/api/automation/v1/{automation.id}")
+
+        assert response.status_code == 404
+
+
+class TestDeleteAutomation:
+    """Tests for DELETE /v1/{id} endpoint."""
+
+    async def test_delete_other_org_members_automation(
+        self, async_client, async_session
+    ):
+        """A member can delete an automation owned by another member of their org."""
+        automation = Automation(
+            user_id=OTHER_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Teammate Automation",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/path/to/code.tar.gz",
+            entrypoint="uv run script.py",
+            enabled=True,
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        response = await async_client.delete(f"/api/automation/v1/{automation.id}")
+
+        assert response.status_code == 204
+        await async_session.refresh(automation)
+        assert automation.enabled is False
+        assert automation.deleted_at is not None
+
+    async def test_delete_automation_soft_deletes(self, async_client, async_session):
+        """DELETE sets enabled=False and deleted_at."""
+        from openhands.automation.models import AutomationRunStatus
+
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="To Delete",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/path/to/code.tar.gz",
+            entrypoint="uv run script.py",
+            enabled=True,
+        )
+        async_session.add(automation)
+        await async_session.flush()
+        pending_run = AutomationRun(
+            automation_id=automation.id,
+            status=AutomationRunStatus.PENDING,
+        )
+        async_session.add(pending_run)
+        await async_session.commit()
+        automation_id = automation.id
+
+        response = await async_client.delete(f"/api/automation/v1/{automation_id}")
+
+        assert response.status_code == 204
+
+        # Refresh from DB
+        await async_session.refresh(automation)
+        await async_session.refresh(pending_run)
+        assert automation.enabled is False
+        assert automation.deleted_at is not None
+        assert automation.disabled_reason == "manual_delete"
+        assert automation.disabled_detail == {
+            "reason": "manual_delete",
+            "source": "user",
+        }
+        assert automation.disabled_at == automation.deleted_at
+        assert pending_run.status == AutomationRunStatus.SKIPPED
+        assert pending_run.completed_at == automation.deleted_at
+        assert pending_run.status_detail is not None
+        assert pending_run.status_detail["detail"] == "Automation deleted by user"
+        assert pending_run.status_detail["disabled_detail"] == {
+            "reason": "manual_delete",
+            "source": "user",
+        }
+
+        events = (
+            (
+                await async_session.execute(
+                    select(AutomationDisableEvent).where(
+                        AutomationDisableEvent.automation_id == automation.id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(events) == 1
+        assert events[0].reason == "manual_delete"
+        assert events[0].detail == {"reason": "manual_delete", "source": "user"}
+        assert events[0].source == "manual_delete"
+
+    async def test_delete_automation_not_found(self, async_client):
+        """DELETE on non-existent ID returns 404."""
+        fake_id = uuid.uuid4()
+
+        response = await async_client.delete(f"/api/automation/v1/{fake_id}")
+
+        assert response.status_code == 404
+
+    async def test_delete_automation_cross_org_returns_404(
+        self, async_client, async_session
+    ):
+        """Cannot delete automation from another organization."""
+        automation = Automation(
+            user_id=OTHER_USER_ID,
+            org_id=OTHER_ORG_ID,
+            name="Other Org Automation",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/path/to/code.tar.gz",
+            entrypoint="uv run script.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        response = await async_client.delete(f"/api/automation/v1/{automation.id}")
+
+        assert response.status_code == 404
+
+    async def test_delete_automation_already_deleted(self, async_client, async_session):
+        """DELETE on already deleted automation returns 404."""
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Already Deleted",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/path/to/code.tar.gz",
+            entrypoint="uv run script.py",
+            deleted_at=utcnow(),
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        response = await async_client.delete(f"/api/automation/v1/{automation.id}")
+
+        assert response.status_code == 404
+
+
+class TestUpdateAutomation:
+    """Tests for PATCH /v1/{id} endpoint."""
+
+    async def test_update_automation_name(self, async_client, async_session):
+        """PATCH updates the automation name."""
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Original Name",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/path/to/code.tar.gz",
+            entrypoint="uv run script.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        response = await async_client.patch(
+            f"/api/automation/v1/{automation.id}",
+            json={"name": "Updated Name"},
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["name"] == "Updated Name"
+        assert data["entrypoint"] == "uv run script.py"
+
+    async def test_update_automation_schedule(self, async_client, async_session):
+        """PATCH updates the trigger schedule."""
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Test",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/code.tar.gz",
+            entrypoint="uv run script.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        response = await async_client.patch(
+            f"/api/automation/v1/{automation.id}",
+            json={"trigger": {"type": "cron", "schedule": "*/5 * * * *"}},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["trigger"]["schedule"] == "*/5 * * * *"
+
+    async def test_update_automation_disable(self, async_client, async_session):
+        """PATCH can disable an automation."""
+        from openhands.automation.models import AutomationRunStatus
+
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Test",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/code.tar.gz",
+            entrypoint="uv run script.py",
+            enabled=True,
+        )
+        async_session.add(automation)
+        await async_session.flush()
+        pending_run = AutomationRun(
+            automation_id=automation.id,
+            status=AutomationRunStatus.PENDING,
+        )
+        async_session.add(pending_run)
+        await async_session.commit()
+
+        response = await async_client.patch(
+            f"/api/automation/v1/{automation.id}",
+            json={"enabled": False},
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["enabled"] is False
+        assert data["disabled_reason"] == "manual"
+        assert data["disabled_detail"] == {"reason": "manual", "source": "user"}
+        assert data["disabled_at"] is not None
+
+        await async_session.refresh(automation)
+        await async_session.refresh(pending_run)
+        assert automation.disabled_reason == "manual"
+        assert automation.disabled_detail == {"reason": "manual", "source": "user"}
+        assert automation.disabled_at is not None
+        assert pending_run.status == AutomationRunStatus.SKIPPED
+        assert pending_run.completed_at == automation.disabled_at
+        assert pending_run.status_detail is not None
+        assert pending_run.status_detail["detail"] == "Automation disabled by user"
+        assert pending_run.status_detail["disabled_detail"] == {
+            "reason": "manual",
+            "source": "user",
+        }
+
+        events = (
+            (
+                await async_session.execute(
+                    select(AutomationDisableEvent).where(
+                        AutomationDisableEvent.automation_id == automation.id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(events) == 1
+        assert events[0].reason == "manual"
+        assert events[0].detail == {"reason": "manual", "source": "user"}
+        assert events[0].source == "manual"
+
+    async def test_update_automation_model_profile(self, async_client, async_session):
+        """PATCH can update the selected model profile."""
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Test",
+            model="original-profile",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/code.tar.gz",
+            entrypoint="uv run script.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        response = await async_client.patch(
+            f"/api/automation/v1/{automation.id}",
+            json={"model": "new-profile"},
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["model"] == "new-profile"
+        await async_session.refresh(automation)
+        assert automation.model == "new-profile"
+
+    async def test_update_automation_null_model_profile_resets_to_active(
+        self, async_client, async_session, mock_authenticated_user
+    ):
+        """PATCH model=null stores the current active profile name."""
+        mock_authenticated_user.model_profile_names = frozenset({"active-profile"})
+        mock_authenticated_user.active_model_profile_name = "active-profile"
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Test",
+            model="original-profile",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/code.tar.gz",
+            entrypoint="uv run script.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        response = await async_client.patch(
+            f"/api/automation/v1/{automation.id}",
+            json={"model": None},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["model"] == "active-profile"
+        await async_session.refresh(automation)
+        assert automation.model == "active-profile"
+
+    async def test_update_automation_unknown_model_profile_rejected(
+        self, async_client, async_session, mock_authenticated_user
+    ):
+        """PATCH rejects unknown model profiles when auth metadata includes names."""
+        mock_authenticated_user.model_profile_names = frozenset({"allowed-profile"})
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Test",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/code.tar.gz",
+            entrypoint="uv run script.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        response = await async_client.patch(
+            f"/api/automation/v1/{automation.id}",
+            json={"model": "missing-profile"},
+        )
+
+        assert response.status_code == 422
+        assert response.json()["detail"] == "Model profile `missing-profile` not found"
+
+    async def test_update_automation_not_found(self, async_client):
+        """PATCH on non-existent automation returns 404."""
+        fake_id = uuid.uuid4()
+
+        response = await async_client.patch(
+            f"/api/automation/v1/{fake_id}",
+            json={"name": "Updated"},
+        )
+
+        assert response.status_code == 404
+
+    async def test_update_automation_cross_org_returns_404(
+        self, async_client, async_session
+    ):
+        """Cannot update automation from another organization."""
+        automation = Automation(
+            user_id=OTHER_USER_ID,
+            org_id=OTHER_ORG_ID,
+            name="Other Org",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/code.tar.gz",
+            entrypoint="uv run script.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        response = await async_client.patch(
+            f"/api/automation/v1/{automation.id}",
+            json={"name": "Hacked"},
+        )
+
+        assert response.status_code == 404
+
+    async def test_update_automation_prompt(self, async_client, async_session):
+        """PATCH updates the automation prompt."""
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Prompt Update Test",
+            prompt="Original prompt",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/code.tar.gz",
+            entrypoint="python main.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        response = await async_client.patch(
+            f"/api/automation/v1/{automation.id}",
+            json={"prompt": "Updated prompt"},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["prompt"] == "Updated prompt"
+
+    async def test_update_prompt_regenerates_preset_tarball(
+        self, async_client, async_session, preset_store
+    ):
+        """Editing the prompt rebuilds the baked tarball the dispatcher executes."""
+        # Arrange — a prompt-preset automation whose tarball bakes "Original prompt".
+        automation = await _seed_prompt_preset_automation(
+            async_session, preset_store, "Original prompt"
+        )
+        original_tarball_path = automation.tarball_path
+        old_upload_id = parse_internal_upload_id(original_tarball_path)
+        assert old_upload_id is not None
+        old_storage_path = _build_storage_path(TEST_ORG_ID, TEST_USER_ID, old_upload_id)
+
+        # Act — edit the prompt.
+        response = await async_client.patch(
+            f"/api/automation/v1/{automation.id}",
+            json={"prompt": "Updated prompt"},
+        )
+
+        # Assert — both the stored prompt and the executable tarball reflect the edit.
+        assert response.status_code == 200
+        data = response.json()
+        assert data["prompt"] == "Updated prompt"
+        assert data["tarball_path"] != original_tarball_path
+
+        new_upload_id = parse_internal_upload_id(data["tarball_path"])
+        assert new_upload_id is not None
+        new_storage_path = _build_storage_path(TEST_ORG_ID, TEST_USER_ID, new_upload_id)
+        with tarfile.open(
+            fileobj=io.BytesIO(preset_store._storage[new_storage_path]), mode="r:gz"
+        ) as tar:
+            prompt_file = tar.extractfile("prompt.txt")
+            assert prompt_file is not None
+            assert prompt_file.read().decode() == "Updated prompt"
+
+        # The superseded tarball file is removed so storage doesn't grow unbounded.
+        assert old_storage_path not in preset_store._storage
+
+    async def test_update_prompt_syncs_preset_metadata(
+        self, async_client, async_session, preset_store
+    ):
+        """Editing the prompt updates the prompt recorded in preset metadata."""
+        # Arrange — a preset automation whose metadata records the original prompt.
+        automation = await _seed_prompt_preset_automation(
+            async_session, preset_store, "Original prompt"
+        )
+        automation.preset_metadata = {
+            "preset_type": "prompt",
+            "prompt": "Original prompt",
+            "repos": [{"url": "owner/repo"}],
+        }
+        await async_session.commit()
+
+        # Act — edit the prompt.
+        response = await async_client.patch(
+            f"/api/automation/v1/{automation.id}",
+            json={"prompt": "Updated prompt"},
+        )
+
+        # Assert — the metadata prompt follows the edit; other keys are preserved.
+        assert response.status_code == 200
+        assert response.json()["preset_metadata"] == {
+            "preset_type": "prompt",
+            "prompt": "Updated prompt",
+            "repos": [{"url": "owner/repo"}],
+        }
+
+    async def test_update_name_does_not_regenerate_preset_tarball(
+        self, async_client, async_session, preset_store
+    ):
+        """Editing a non-prompt field leaves the baked tarball untouched."""
+        # Arrange
+        automation = await _seed_prompt_preset_automation(
+            async_session, preset_store, "Original prompt"
+        )
+        original_tarball_path = automation.tarball_path
+
+        # Act — edit only the name.
+        response = await async_client.patch(
+            f"/api/automation/v1/{automation.id}",
+            json={"name": "Renamed"},
+        )
+
+        # Assert — name changes, tarball reference is preserved.
+        assert response.status_code == 200
+        data = response.json()
+        assert data["name"] == "Renamed"
+        assert data["tarball_path"] == original_tarball_path
+
+    async def test_update_unchanged_prompt_does_not_regenerate_tarball(
+        self, async_client, async_session, preset_store
+    ):
+        """Re-sending the same prompt is a no-op: no tarball rebuild, no new upload."""
+        # Arrange
+        automation = await _seed_prompt_preset_automation(
+            async_session, preset_store, "Same prompt"
+        )
+        original_tarball_path = automation.tarball_path
+
+        # Act — PATCH the prompt with the value it already has.
+        response = await async_client.patch(
+            f"/api/automation/v1/{automation.id}",
+            json={"prompt": "Same prompt"},
+        )
+
+        # Assert — tarball untouched and no new upload was written.
+        assert response.status_code == 200
+        assert response.json()["tarball_path"] == original_tarball_path
+        preset_store.write_stream.assert_not_called()
+
+    async def test_update_prompt_upload_failure_returns_500(
+        self, async_client, async_session, preset_store
+    ):
+        """If the regenerated tarball fails to upload, the edit fails cleanly.
+
+        A 500 is returned and the automation still points at its original
+        tarball — no half-committed state leaks through.
+        """
+        # Arrange — make the upload step fail.
+        automation = await _seed_prompt_preset_automation(
+            async_session, preset_store, "Original prompt"
+        )
+        original_tarball_path = automation.tarball_path
+        preset_store.write_stream = AsyncMock(side_effect=RuntimeError("storage down"))
+
+        # Act
+        response = await async_client.patch(
+            f"/api/automation/v1/{automation.id}",
+            json={"prompt": "Updated prompt"},
+        )
+
+        # Assert
+        assert response.status_code == 500
+        await async_session.refresh(automation)
+        assert automation.tarball_path == original_tarball_path
+
+    async def test_update_prompt_transient_storage_error_fails_the_edit(
+        self, async_client, async_session, preset_store
+    ):
+        """A transient storage error during a prompt edit fails the request.
+
+        Previously it was swallowed as "nothing to regenerate": the PATCH
+        returned 200 and updated the prompt column while the tarball kept the
+        old baked prompt, so the automation silently kept running the previous
+        prompt.
+        """
+        # Arrange — reading the current tarball fails transiently (e.g. S3 5xx).
+        automation = await _seed_prompt_preset_automation(
+            async_session, preset_store, "Original prompt"
+        )
+        preset_store.read = MagicMock(
+            side_effect=FileNotFoundError("S3 read failed (ServiceUnavailable)")
+        )
+
+        # Act & Assert — the request fails (rolling back the edit in
+        # production) instead of succeeding with a stale tarball.
+        with pytest.raises(FileNotFoundError):
+            await async_client.patch(
+                f"/api/automation/v1/{automation.id}",
+                json={"prompt": "Updated prompt"},
+            )
+        preset_store.write_stream.assert_not_called()
+
+    async def test_update_prompt_missing_source_tarball_skips_regeneration(
+        self, async_client, async_session, preset_store
+    ):
+        """A confirmed-missing source tarball leaves the tarball untouched.
+
+        Only genuine absence means "not a regenerable preset": the prompt
+        column still updates, but no new upload is written and the automation
+        keeps its existing tarball reference.
+        """
+        # Arrange — the current tarball object is confirmed absent.
+        automation = await _seed_prompt_preset_automation(
+            async_session, preset_store, "Original prompt"
+        )
+        original_tarball_path = automation.tarball_path
+        preset_store.read = MagicMock(side_effect=ObjectNotFoundError("File not found"))
+
+        # Act
+        response = await async_client.patch(
+            f"/api/automation/v1/{automation.id}",
+            json={"prompt": "Updated prompt"},
+        )
+
+        # Assert
+        assert response.status_code == 200
+        data = response.json()
+        assert data["prompt"] == "Updated prompt"
+        assert data["tarball_path"] == original_tarball_path
+        preset_store.write_stream.assert_not_called()
+
+    async def test_failed_update_does_not_delete_current_tarball(
+        self, async_client, async_session, preset_store
+    ):
+        """A request that fails after regeneration keeps the current tarball.
+
+        The superseded object may only be removed once the transaction commits.
+        Deleting it earlier meant a later failure rolled the automation back to
+        a tarball reference whose object was already destroyed, permanently
+        breaking every future dispatch (OSS-9505).
+        """
+        # Arrange — fail the request after the tarball has been regenerated.
+        automation = await _seed_prompt_preset_automation(
+            async_session, preset_store, "Original prompt"
+        )
+        old_upload_id = parse_internal_upload_id(automation.tarball_path)
+        assert old_upload_id is not None
+        old_storage_path = _build_storage_path(TEST_ORG_ID, TEST_USER_ID, old_upload_id)
+
+        # Act
+        with patch(
+            "openhands.automation.router.mark_git_sync_dirty",
+            AsyncMock(side_effect=RuntimeError("boom")),
+        ):
+            with pytest.raises(RuntimeError):
+                await async_client.patch(
+                    f"/api/automation/v1/{automation.id}",
+                    json={"prompt": "Updated prompt"},
+                )
+
+        # Assert — the object the automation still points at survives.
+        assert old_storage_path in preset_store._storage
+
+    async def test_update_automation_timeout(self, async_client, async_session):
+        """Can update automation timeout."""
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Update Timeout",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/code.tar.gz",
+            entrypoint="uv run script.py",
+            timeout=300,
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        response = await async_client.patch(
+            f"/api/automation/v1/{automation.id}",
+            json={"timeout": 120},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["timeout"] == 120
+
+    async def test_update_automation_timeout_invalid(self, async_client, async_session):
+        """Cannot update timeout to invalid value."""
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Invalid Timeout Update",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/code.tar.gz",
+            entrypoint="uv run script.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        response = await async_client.patch(
+            f"/api/automation/v1/{automation.id}",
+            json={"timeout": -10},
+        )
+
+        assert response.status_code == 422
+
+    async def test_update_automation_timeout_exceeds_max(
+        self, async_client, async_session
+    ):
+        """Cannot update timeout to exceed the 30-minute user maximum."""
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Max Timeout Update",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/code.tar.gz",
+            entrypoint="uv run script.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        response = await async_client.patch(
+            f"/api/automation/v1/{automation.id}",
+            json={"timeout": 1801},  # 30-minute maximum is 1800 seconds
+        )
+
+        assert response.status_code == 422
+
+
+class TestDispatchAutomation:
+    """Tests for POST /v1/{id}/dispatch endpoint."""
+
+    async def test_dispatch_automation_success(
+        self, async_client, async_session, local_mode
+    ):
+        """Dispatching an automation creates a PENDING run."""
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Test Dispatch",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/code.tar.gz",
+            entrypoint="uv run script.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        response = await async_client.post(
+            f"/api/automation/v1/{automation.id}/dispatch",
+            headers={"X-OpenHands-Telemetry-Distinct-Id": "ph-fe-dispatcher"},
+        )
+
+        assert response.status_code == 201
+        data = response.json()
+        assert data["automation_id"] == str(automation.id)
+        assert data["status"] == "PENDING"
+        assert data["error_detail"] is None
+        assert "id" in data
+        assert "created_at" in data
+        assert data["started_at"] is None
+        assert data["completed_at"] is None
+        run = await async_session.get(AutomationRun, uuid.UUID(data["id"]))
+        assert run is not None
+        assert run.telemetry_distinct_id == "ph-fe-dispatcher"
+
+    async def test_dispatch_automation_not_found(self, async_client):
+        """Dispatching a nonexistent automation returns 404."""
+        fake_id = uuid.uuid4()
+
+        response = await async_client.post(f"/api/automation/v1/{fake_id}/dispatch")
+
+        assert response.status_code == 404
+        assert "Automation not found" in response.json()["detail"]
+
+    async def test_dispatch_disabled_automation_returns_reason(
+        self, async_client, async_session
+    ):
+        """Dispatching a disabled automation returns its blocking reason."""
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Disabled Automation",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/code.tar.gz",
+            entrypoint="uv run script.py",
+            enabled=False,
+            disabled_reason="auth: Invalid API key",
+            disabled_detail={"kind": "auth", "threshold": 3},
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        response = await async_client.post(
+            f"/api/automation/v1/{automation.id}/dispatch"
+        )
+
+        assert response.status_code == 409
+        detail = response.json()["detail"]
+        assert detail["message"] == "Automation is disabled"
+        assert detail["disabled_reason"] == "auth: Invalid API key"
+        assert detail["disabled_detail"] == {"kind": "auth", "threshold": 3}
+
+    async def test_dispatch_automation_deleted(self, async_client, async_session):
+        """Dispatching a soft-deleted automation returns 404."""
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Deleted Automation",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/code.tar.gz",
+            entrypoint="uv run script.py",
+            deleted_at=utcnow(),
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        response = await async_client.post(
+            f"/api/automation/v1/{automation.id}/dispatch"
+        )
+
+        assert response.status_code == 404
+
+    async def test_dispatch_automation_cross_org_returns_404(
+        self, async_client, async_session
+    ):
+        """Cannot dispatch automation from another organization."""
+        automation = Automation(
+            user_id=OTHER_USER_ID,
+            org_id=OTHER_ORG_ID,
+            name="Other Org Automation",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/code.tar.gz",
+            entrypoint="uv run script.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        response = await async_client.post(
+            f"/api/automation/v1/{automation.id}/dispatch"
+        )
+
+        assert response.status_code == 404
+
+    async def test_dispatch_automation_multiple_runs(self, async_client, async_session):
+        """Multiple dispatches create multiple independent runs."""
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Test Multiple Runs",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/code.tar.gz",
+            entrypoint="uv run script.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        resp1 = await async_client.post(f"/api/automation/v1/{automation.id}/dispatch")
+        resp2 = await async_client.post(f"/api/automation/v1/{automation.id}/dispatch")
+
+        assert resp1.status_code == 201
+        assert resp2.status_code == 201
+
+        run1 = resp1.json()
+        run2 = resp2.json()
+
+        # Each dispatch creates a unique run
+        assert run1["id"] != run2["id"]
+        assert run1["automation_id"] == run2["automation_id"] == str(automation.id)
+        assert run1["status"] == run2["status"] == "PENDING"
+
+    async def test_dispatch_updates_last_triggered_at(
+        self, async_client, async_session
+    ):
+        """Dispatching updates the automation's last_triggered_at."""
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Test Trigger Update",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/code.tar.gz",
+            entrypoint="uv run script.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        assert automation.last_triggered_at is None
+
+        response = await async_client.post(
+            f"/api/automation/v1/{automation.id}/dispatch"
+        )
+
+        assert response.status_code == 201
+
+        # Refresh from DB to verify last_triggered_at was updated
+        await async_session.refresh(automation)
+        assert automation.last_triggered_at is not None
+
+
+class TestListAutomationRuns:
+    """Tests for GET /v1/{id}/runs endpoint."""
+
+    async def test_list_runs_empty(self, async_client, async_session):
+        """Listing runs for automation with no runs returns empty list."""
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Test Automation",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/code.tar.gz",
+            entrypoint="uv run script.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        response = await async_client.get(f"/api/automation/v1/{automation.id}/runs")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["runs"] == []
+        assert data["total"] == 0
+        assert data["status_counts"] == {}
+
+    async def test_list_runs_returns_runs(self, async_client, async_session):
+        """Listing runs after dispatch shows created runs."""
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Test Automation",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/code.tar.gz",
+            entrypoint="uv run script.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        # Dispatch a run
+        dispatch_resp = await async_client.post(
+            f"/api/automation/v1/{automation.id}/dispatch"
+        )
+        assert dispatch_resp.status_code == 201
+        run_id = dispatch_resp.json()["id"]
+
+        # List runs
+        response = await async_client.get(f"/api/automation/v1/{automation.id}/runs")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["total"] == 1
+        assert len(data["runs"]) == 1
+        assert data["runs"][0]["id"] == run_id
+        assert data["runs"][0]["automation_id"] == str(automation.id)
+
+    async def test_list_runs_ordered_by_latest(self, async_client, async_session):
+        """Runs are returned in descending order by creation time."""
+        from datetime import timedelta
+
+        from openhands.automation.models import AutomationRun, AutomationRunStatus
+
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Test Automation",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/code.tar.gz",
+            entrypoint="uv run script.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        # Create runs with explicit different timestamps to ensure ordering
+        now = utcnow()
+        run_ids = []
+        for i in range(3):
+            run = AutomationRun(
+                automation_id=automation.id,
+                status=AutomationRunStatus.PENDING,
+                created_at=now + timedelta(seconds=i),  # Each run 1 second later
+            )
+            async_session.add(run)
+            await async_session.flush()
+            run_ids.append(str(run.id))
+        await async_session.commit()
+
+        # List runs
+        response = await async_client.get(f"/api/automation/v1/{automation.id}/runs")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["total"] == 3
+
+        # Verify order: latest first (reverse of creation order)
+        returned_ids = [r["id"] for r in data["runs"]]
+        assert returned_ids == list(reversed(run_ids))
+
+    async def test_list_runs_pagination(self, async_client, async_session):
+        """Pagination works correctly."""
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Test Automation",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/code.tar.gz",
+            entrypoint="uv run script.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        # Dispatch 5 runs
+        for _ in range(5):
+            resp = await async_client.post(
+                f"/api/automation/v1/{automation.id}/dispatch"
+            )
+            assert resp.status_code == 201
+
+        # Get first page
+        response = await async_client.get(
+            f"/api/automation/v1/{automation.id}/runs",
+            params={"limit": 2, "offset": 0},
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["total"] == 5
+        assert len(data["runs"]) == 2
+
+        # Get second page
+        response = await async_client.get(
+            f"/api/automation/v1/{automation.id}/runs",
+            params={"limit": 2, "offset": 2},
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["total"] == 5
+        assert len(data["runs"]) == 2
+
+    async def test_list_runs_counts_by_status(self, async_client, async_session):
+        """status_counts reports lifetime per-status counts, sparsely."""
+        from openhands.automation.models import AutomationRun, AutomationRunStatus
+
+        # Arrange — runs across three statuses; CANCELLED/SKIPPED never occur.
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Test Automation",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/code.tar.gz",
+            entrypoint="uv run script.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+        for status in [
+            AutomationRunStatus.COMPLETED,
+            AutomationRunStatus.COMPLETED,
+            AutomationRunStatus.FAILED,
+            AutomationRunStatus.PENDING,
+        ]:
+            async_session.add(AutomationRun(automation_id=automation.id, status=status))
+        await async_session.commit()
+
+        # Act
+        response = await async_client.get(f"/api/automation/v1/{automation.id}/runs")
+
+        # Assert — only statuses with runs appear, and total is their sum.
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status_counts"] == {
+            "COMPLETED": 2,
+            "FAILED": 1,
+            "PENDING": 1,
+        }
+        assert data["total"] == 4
+
+    async def test_list_runs_counts_unaffected_by_pagination(
+        self, async_client, async_session
+    ):
+        """status_counts stays lifetime-wide on a paginated page."""
+        from openhands.automation.models import AutomationRun, AutomationRunStatus
+
+        # Arrange
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Test Automation",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/code.tar.gz",
+            entrypoint="uv run script.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+        for _ in range(3):
+            async_session.add(
+                AutomationRun(
+                    automation_id=automation.id,
+                    status=AutomationRunStatus.COMPLETED,
+                )
+            )
+        await async_session.commit()
+
+        # Act
+        response = await async_client.get(
+            f"/api/automation/v1/{automation.id}/runs",
+            params={"limit": 1, "offset": 1},
+        )
+
+        # Assert
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data["runs"]) == 1
+        assert data["status_counts"] == {"COMPLETED": 3}
+
+    async def test_list_runs_not_found(self, async_client):
+        """Listing runs for nonexistent automation returns 404."""
+        fake_id = uuid.uuid4()
+
+        response = await async_client.get(f"/api/automation/v1/{fake_id}/runs")
+
+        assert response.status_code == 404
+        assert "Automation not found" in response.json()["detail"]
+
+    async def test_list_runs_cross_org_returns_404(self, async_client, async_session):
+        """Cannot list runs for automation from another organization."""
+        automation = Automation(
+            user_id=OTHER_USER_ID,
+            org_id=OTHER_ORG_ID,
+            name="Other Org Automation",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/code.tar.gz",
+            entrypoint="uv run script.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        response = await async_client.get(f"/api/automation/v1/{automation.id}/runs")
+
+        assert response.status_code == 404
+
+    async def test_list_runs_deleted_automation(self, async_client, async_session):
+        """Listing runs for deleted automation returns 404."""
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Deleted Automation",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/code.tar.gz",
+            entrypoint="uv run script.py",
+            deleted_at=utcnow(),
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        response = await async_client.get(f"/api/automation/v1/{automation.id}/runs")
+
+        assert response.status_code == 404
+
+    async def test_list_runs_limit_exceeds_max(self, async_client, async_session):
+        """Requesting more than 100 results returns 422."""
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Test Automation",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/code.tar.gz",
+            entrypoint="uv run script.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        response = await async_client.get(
+            f"/api/automation/v1/{automation.id}/runs",
+            params={"limit": 101},
+        )
+
+        assert response.status_code == 422
+
+    async def test_list_runs_default_limit_is_50(self, async_client, async_session):
+        """Default limit is 50 results."""
+        from openhands.automation.models import AutomationRun, AutomationRunStatus
+
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Test Automation",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/code.tar.gz",
+            entrypoint="uv run script.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        # Create 60 runs directly in DB
+        for _ in range(60):
+            run = AutomationRun(
+                automation_id=automation.id,
+                status=AutomationRunStatus.PENDING,
+            )
+            async_session.add(run)
+        await async_session.commit()
+
+        # List runs without specifying limit
+        response = await async_client.get(f"/api/automation/v1/{automation.id}/runs")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["total"] == 60
+        assert len(data["runs"]) == 50  # Default limit
+
+
+class TestBackwardCompatibility:
+    """Tests ensuring existing cron triggers work with discriminated union."""
+
+    async def test_cron_trigger_create_and_retrieve(self, async_client):
+        """Existing cron triggers should still work with discriminated union."""
+        # Create automation with cron trigger using S3 path (valid scheme)
+        response = await async_client.post(
+            "/api/automation/v1",
+            json={
+                "name": "Cron Backward Compat Test",
+                "trigger": {"type": "cron", "schedule": "0 0 * * *", "timezone": "UTC"},
+                "tarball_path": "s3://bucket/backward-compat-test.tar.gz",
+                "entrypoint": "python main.py",
+            },
+        )
+        assert response.status_code == 201
+        automation_id = response.json()["id"]
+
+        # Verify it can be retrieved with correct trigger type
+        response = await async_client.get(f"/api/automation/v1/{automation_id}")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["trigger"]["type"] == "cron"
+        assert data["trigger"]["schedule"] == "0 0 * * *"
+
+    async def test_cron_trigger_with_s3_path(self, async_client):
+        """Cron trigger with S3 path creates and retrieves correctly."""
+        response = await async_client.post(
+            "/api/automation/v1",
+            json={
+                "name": "Cron S3 Test",
+                "trigger": {"type": "cron", "schedule": "0 0 * * *", "timezone": "UTC"},
+                "tarball_path": "s3://bucket/code.tar.gz",
+                "entrypoint": "python main.py",
+            },
+        )
+        assert response.status_code == 201
+        automation_id = response.json()["id"]
+
+        # Verify it can be retrieved
+        response = await async_client.get(f"/api/automation/v1/{automation_id}")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["trigger"]["type"] == "cron"
+        assert data["trigger"]["schedule"] == "0 0 * * *"
+
+    async def test_trigger_missing_type_returns_422(self, async_client):
+        """Trigger without type field returns 422 (fail fast)."""
+        response = await async_client.post(
+            "/api/automation/v1",
+            json={
+                "name": "Missing Type",
+                "trigger": {"schedule": "0 0 * * *"},  # No "type" field
+                "tarball_path": "s3://bucket/code.tar.gz",
+                "entrypoint": "python main.py",
+            },
+        )
+        assert response.status_code == 422
+
+
+class TestCompleteRun:
+    """Tests for POST /runs/{run_id}/complete endpoint."""
+
+    async def test_complete_run_saves_conversation_id_for_completed_runs(
+        self, async_client, async_session
+    ):
+        """Complete endpoint saves conversation_id when status is COMPLETED."""
+        from openhands.automation.models import AutomationRun, AutomationRunStatus
+
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Test Automation",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/code.tar.gz",
+            entrypoint="uv run script.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        # Create a RUNNING run
+        run = AutomationRun(
+            automation_id=automation.id,
+            status=AutomationRunStatus.RUNNING,
+        )
+        async_session.add(run)
+        await async_session.commit()
+
+        # Complete it as COMPLETED with a conversation_id
+        response = await async_client.post(
+            f"/api/automation/v1/runs/{run.id}/complete",
+            json={"status": "COMPLETED", "conversation_id": "conv-completed-123"},
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "COMPLETED"
+        assert data["conversation_id"] == "conv-completed-123"
+
+        # Verify in database
+        await async_session.refresh(run)
+        assert run.conversation_id == "conv-completed-123"
+        assert run.status == AutomationRunStatus.COMPLETED
+
+    async def test_complete_run_ignores_task_result_metadata_for_status_detail(
+        self, async_client, async_session
+    ):
+        """Task result metadata is not trusted for automation disablement."""
+        from openhands.automation.models import AutomationRun, AutomationRunStatus
+
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Task Outcome Automation",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/code.tar.gz",
+            entrypoint="uv run script.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        run = AutomationRun(
+            automation_id=automation.id,
+            status=AutomationRunStatus.RUNNING,
+        )
+        async_session.add(run)
+        await async_session.commit()
+
+        response = await async_client.post(
+            f"/api/automation/v1/runs/{run.id}/complete",
+            json={
+                "status": "COMPLETED",
+                "blocking_factor": {
+                    "kind": "config",
+                    "reason": "User-defined task outcome",
+                    "source": "task",
+                },
+                "task_outcome": {
+                    "success": False,
+                    "message": "User-defined incomplete state",
+                    "classification": {"kind": "auth", "user_action": "settings"},
+                },
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "COMPLETED"
+        assert data["status_detail"] is None
+
+        await async_session.refresh(run)
+        assert run.status == AutomationRunStatus.COMPLETED
+        assert run.status_detail is None
+
+    async def test_failed_complete_run_uses_sdk_callback_error_classification(
+        self, async_client, async_session
+    ):
+        """Only SDK callback errors classify failed callbacks for disablement."""
+        from openhands.automation.models import AutomationRun, AutomationRunStatus
+
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Callback Error Automation",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/code.tar.gz",
+            entrypoint="uv run script.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        run = AutomationRun(
+            automation_id=automation.id,
+            status=AutomationRunStatus.RUNNING,
+        )
+        async_session.add(run)
+        await async_session.commit()
+
+        response = await async_client.post(
+            f"/api/automation/v1/runs/{run.id}/complete",
+            json={
+                "status": "FAILED",
+                "error": {
+                    "source": "environment",
+                    "code": "MissingSecret",
+                    "detail": "Missing GitHub token",
+                    "classification": {
+                        "kind": "auth",
+                        "retryable": False,
+                        "user_action": "settings",
+                    },
+                },
+                "task_outcome": {
+                    "success": False,
+                    "classification": {"kind": "quota", "user_action": "settings"},
+                },
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "FAILED"
+        assert data["status_detail"]["kind"] == "auth"
+        assert data["status_detail"]["source"] == "environment"
+        assert data["status_detail"]["code"] == "MissingSecret"
+        assert data["status_detail"]["user_action"] == "settings"
+        assert "blocking_factor" not in data["status_detail"]
+
+        await async_session.refresh(run)
+        assert run.status == AutomationRunStatus.FAILED
+        assert run.status_detail is not None
+        assert run.status_detail["kind"] == "auth"
+        assert run.status_detail["source"] == "environment"
+
+    async def test_failed_complete_run_ignores_task_outcome_without_sdk_error(
+        self, async_client, async_session
+    ):
+        """User-defined task outcomes alone remain generic execution failures."""
+        from openhands.automation.models import AutomationRun, AutomationRunStatus
+
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Generic Failure Automation",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/code.tar.gz",
+            entrypoint="uv run script.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        run = AutomationRun(
+            automation_id=automation.id,
+            status=AutomationRunStatus.RUNNING,
+        )
+        async_session.add(run)
+        await async_session.commit()
+
+        response = await async_client.post(
+            f"/api/automation/v1/runs/{run.id}/complete",
+            json={
+                "status": "FAILED",
+                "task_outcome": {
+                    "success": False,
+                    "message": "User-defined failed task",
+                    "classification": {"kind": "auth", "user_action": "settings"},
+                },
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "FAILED"
+        assert data["error_detail"] == "Completion callback reported failure"
+        assert data["status_detail"]["kind"] == "execution_error"
+        assert data["status_detail"]["source"] == "sdk_callback"
+        assert "user_action" not in data["status_detail"]
+
+        await async_session.refresh(run)
+        assert run.status == AutomationRunStatus.FAILED
+        assert run.status_detail is not None
+        assert run.status_detail["kind"] == "execution_error"
+
+    async def test_complete_run_stores_finish_tool_response_metadata(
+        self, async_client, async_session, monkeypatch
+    ):
+        """Complete endpoint stores the raw latest FinishTool response."""
+        from openhands.automation.models import AutomationRun, AutomationRunStatus
+
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Test Automation",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/code.tar.gz",
+            entrypoint="uv run script.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        run = AutomationRun(
+            automation_id=automation.id,
+            status=AutomationRunStatus.RUNNING,
+            run_metadata={"existing": "value"},
+        )
+        async_session.add(run)
+        await async_session.commit()
+
+        async def fake_fetch_latest_finish_tool_response_for_run(
+            callback_run, conversation_id
+        ):
+            assert callback_run.id == run.id
+            assert conversation_id == "conv-outcome-123"
+            return {
+                "status": "success",
+                "outcome_summary": "Completed all requested work.",
+                "confidence": 0.95,
+                "terminal_reason": "finish_action",
+            }
+
+        monkeypatch.setattr(
+            "openhands.automation.router.fetch_latest_finish_tool_response_for_run",
+            fake_fetch_latest_finish_tool_response_for_run,
+        )
+
+        response = await async_client.post(
+            f"/api/automation/v1/runs/{run.id}/complete",
+            json={"status": "COMPLETED", "conversation_id": "conv-outcome-123"},
+        )
+
+        assert response.status_code == 200
+        finish_tool_response = response.json()["run_metadata"]["finish_tool_response"]
+        assert finish_tool_response == {
+            "status": "success",
+            "outcome_summary": "Completed all requested work.",
+            "confidence": 0.95,
+            "terminal_reason": "finish_action",
+        }
+
+        await async_session.refresh(run)
+        assert run.run_metadata is not None
+        assert run.run_metadata["existing"] == "value"
+        assert run.run_metadata["finish_tool_response"]["status"] == "success"
+
+        assert run.status == AutomationRunStatus.COMPLETED
+
+    async def test_complete_run_saves_conversation_id_for_failed_runs(
+        self, async_client, async_session
+    ):
+        """Complete endpoint saves conversation_id when status is FAILED."""
+        from openhands.automation.models import AutomationRun, AutomationRunStatus
+
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Test Automation",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/code.tar.gz",
+            entrypoint="uv run script.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        # Create a RUNNING run
+        run = AutomationRun(
+            automation_id=automation.id,
+            status=AutomationRunStatus.RUNNING,
+        )
+        async_session.add(run)
+        await async_session.commit()
+
+        # Complete it as FAILED with a conversation_id and error
+        response = await async_client.post(
+            f"/api/automation/v1/runs/{run.id}/complete",
+            json={
+                "status": "FAILED",
+                "conversation_id": "conv-failed-456",
+                "error": "Test error message",
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "FAILED"
+        assert data["conversation_id"] == "conv-failed-456"
+        assert data["error_detail"] == "Test error message"
+
+        # Verify in database
+        await async_session.refresh(run)
+        assert run.conversation_id == "conv-failed-456"
+        assert run.status == AutomationRunStatus.FAILED
+        assert run.error_detail == "Test error message"
+
+    async def test_complete_run_without_conversation_id(
+        self, async_client, async_session
+    ):
+        """Complete endpoint works without conversation_id."""
+        from openhands.automation.models import AutomationRun, AutomationRunStatus
+
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Test Automation",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/code.tar.gz",
+            entrypoint="uv run script.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        # Create a RUNNING run
+        run = AutomationRun(
+            automation_id=automation.id,
+            status=AutomationRunStatus.RUNNING,
+        )
+        async_session.add(run)
+        await async_session.commit()
+
+        # Complete without conversation_id
+        response = await async_client.post(
+            f"/api/automation/v1/runs/{run.id}/complete",
+            json={"status": "COMPLETED"},
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "COMPLETED"
+        assert data["conversation_id"] is None
+
+    async def test_complete_run_failed_with_structured_sdk_error(
+        self, async_client, async_session
+    ):
+        """Complete endpoint accepts SDK ConversationErrorEvent callback errors."""
+        from openhands.automation.models import AutomationRun, AutomationRunStatus
+
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Test Automation",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/code.tar.gz",
+            entrypoint="uv run script.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        run = AutomationRun(
+            automation_id=automation.id,
+            status=AutomationRunStatus.RUNNING,
+        )
+        async_session.add(run)
+        await async_session.commit()
+
+        response = await async_client.post(
+            f"/api/automation/v1/runs/{run.id}/complete",
+            json={
+                "status": "FAILED",
+                "conversation_id": "conv-structured-789",
+                "error": {
+                    "source": "environment",
+                    "code": "RuntimeError",
+                    "detail": "script crashed",
+                    "classification": {"kind": "unknown", "retryable": False},
+                },
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "FAILED"
+        assert data["conversation_id"] == "conv-structured-789"
+        assert (
+            data["error_detail"]
+            == "RuntimeError: script crashed [kind=unknown, source=environment]"
+        )
+        assert data["status_detail"]["phase"] == "callback"
+        assert data["status_detail"]["kind"] == "unknown"
+        assert data["status_detail"]["source"] == "environment"
+
+        await async_session.refresh(run)
+        assert run.status == AutomationRunStatus.FAILED
+        assert (
+            run.error_detail
+            == "RuntimeError: script crashed [kind=unknown, source=environment]"
+        )
+        assert run.status_detail is not None
+        assert run.status_detail["phase"] == "callback"
+        assert run.status_detail["kind"] == "unknown"
+
+    async def test_complete_run_default_keep_alive_null_cleans_up_sandbox(
+        self, async_client, async_session
+    ):
+        """Default null keep_alive preserves explicit sandbox deletion."""
+        import asyncio
+
+        from openhands.automation.models import AutomationRun, AutomationRunStatus
+
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Default Cleanup",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/code.tar.gz",
+            entrypoint="uv run script.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        run = AutomationRun(
+            automation_id=automation.id,
+            status=AutomationRunStatus.RUNNING,
+            sandbox_id="sandbox-default",
+        )
+        async_session.add(run)
+        await async_session.commit()
+
+        with patch(
+            "openhands.automation.router.cleanup_sandbox", new_callable=AsyncMock
+        ) as mock_cleanup:
+            response = await async_client.post(
+                f"/api/automation/v1/runs/{run.id}/complete",
+                json={"status": "COMPLETED"},
+            )
+            await asyncio.sleep(0)
+
+        assert response.status_code == 200
+        mock_cleanup.assert_awaited_once()
+
+    async def test_complete_run_keep_alive_true_does_not_cleanup_sandbox(
+        self, async_client, async_session
+    ):
+        """keep_alive=true leaves cleanup to the runtime TTL reaper."""
+        from openhands.automation.models import AutomationRun, AutomationRunStatus
+
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Keep Alive",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/code.tar.gz",
+            entrypoint="uv run script.py",
+            keep_alive=True,
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        run = AutomationRun(
+            automation_id=automation.id,
+            status=AutomationRunStatus.RUNNING,
+            sandbox_id="sandbox-keep-alive",
+        )
+        async_session.add(run)
+        await async_session.commit()
+
+        with patch(
+            "openhands.automation.router.cleanup_sandbox", new_callable=AsyncMock
+        ) as mock_cleanup:
+            response = await async_client.post(
+                f"/api/automation/v1/runs/{run.id}/complete",
+                json={"status": "COMPLETED"},
+            )
+
+        assert response.status_code == 200
+        mock_cleanup.assert_not_called()
+
+    async def test_complete_run_keep_alive_false_cleans_up_sandbox(
+        self, async_client, async_session
+    ):
+        """keep_alive=false preserves explicit sandbox deletion."""
+        import asyncio
+
+        from openhands.automation.models import (
+            AutomationRun,
+            AutomationRunStatus,
+        )
+
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Immediate Cleanup",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/code.tar.gz",
+            entrypoint="uv run script.py",
+            keep_alive=False,
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        run = AutomationRun(
+            automation_id=automation.id,
+            status=AutomationRunStatus.RUNNING,
+            sandbox_id="sandbox-immediate",
+        )
+        async_session.add(run)
+        await async_session.commit()
+
+        with patch(
+            "openhands.automation.router.cleanup_sandbox", new_callable=AsyncMock
+        ) as mock_cleanup:
+            response = await async_client.post(
+                f"/api/automation/v1/runs/{run.id}/complete",
+                json={"status": "COMPLETED"},
+            )
+            await asyncio.sleep(0)
+
+        assert response.status_code == 200
+        mock_cleanup.assert_awaited_once()
+
+    async def test_complete_run_not_running_returns_409(
+        self, async_client, async_session
+    ):
+        """Complete endpoint returns 409 if run is not in RUNNING state."""
+        from openhands.automation.models import AutomationRun, AutomationRunStatus
+
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Test Automation",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/code.tar.gz",
+            entrypoint="uv run script.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        # Create a PENDING run (not RUNNING)
+        run = AutomationRun(
+            automation_id=automation.id,
+            status=AutomationRunStatus.PENDING,
+        )
+        async_session.add(run)
+        await async_session.commit()
+
+        # Try to complete it
+        response = await async_client.post(
+            f"/api/automation/v1/runs/{run.id}/complete",
+            json={"status": "COMPLETED"},
+        )
+
+        assert response.status_code == 409
+        assert "PENDING" in response.json()["detail"]
+
+    async def _running_run(self, async_session):
+        """Create an automation with a single RUNNING run."""
+        from openhands.automation.models import AutomationRun, AutomationRunStatus
+
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Test Automation",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/code.tar.gz",
+            entrypoint="uv run script.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        run = AutomationRun(
+            automation_id=automation.id,
+            status=AutomationRunStatus.RUNNING,
+        )
+        async_session.add(run)
+        await async_session.commit()
+        return run
+
+    async def _seed_running_run(self, async_session, preset_metadata):
+        """A RUNNING run on an automation carrying the given preset metadata."""
+        from openhands.automation.models import AutomationRun, AutomationRunStatus
+
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Template Automation",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/code.tar.gz",
+            entrypoint="uv run script.py",
+            preset_metadata=preset_metadata,
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        run = AutomationRun(
+            automation_id=automation.id,
+            status=AutomationRunStatus.RUNNING,
+        )
+        async_session.add(run)
+        await async_session.commit()
+        return automation, run
+
+    async def test_complete_run_saves_cost(self, async_client, async_session):
+        """Complete endpoint stores the accumulated LLM cost reported by the SDK."""
+        run = await self._running_run(async_session)
+
+        response = await async_client.post(
+            f"/api/automation/v1/runs/{run.id}/complete",
+            json={"status": "COMPLETED", "cost": 0.4213},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["cost"] == 0.4213
+        await async_session.refresh(run)
+        assert run.cost == 0.4213
+
+    async def test_complete_run_saves_cost_for_failed_runs(
+        self, async_client, async_session
+    ):
+        """Failed runs record their cost too — they still spent money."""
+        run = await self._running_run(async_session)
+
+        response = await async_client.post(
+            f"/api/automation/v1/runs/{run.id}/complete",
+            json={"status": "FAILED", "error": "boom", "cost": 1.5},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["cost"] == 1.5
+
+    async def test_complete_run_without_cost_leaves_it_unset(
+        self, async_client, async_session
+    ):
+        """Callbacks from SDK versions that don't report cost still succeed."""
+        run = await self._running_run(async_session)
+
+        response = await async_client.post(
+            f"/api/automation/v1/runs/{run.id}/complete",
+            json={"status": "COMPLETED"},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["cost"] is None
+        await async_session.refresh(run)
+        assert run.cost is None
+
+    async def _terminal_run(self, async_session, status, error_detail=None):
+        """Create an automation with a run already in a terminal state."""
+        from openhands.automation.models import AutomationRun
+
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="Test Automation",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/code.tar.gz",
+            entrypoint="uv run script.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        run = AutomationRun(
+            automation_id=automation.id,
+            status=status,
+            error_detail=error_detail,
+            completed_at=utcnow(),
+        )
+        async_session.add(run)
+        await async_session.commit()
+        return run
+
+    async def test_complete_run_reconciles_watchdog_timeout_with_late_success(
+        self, async_client, async_session
+    ):
+        """A COMPLETED callback overrides a watchdog-authored timeout FAILED."""
+        from openhands.automation.models import AutomationRunStatus
+
+        run = await self._terminal_run(
+            async_session,
+            AutomationRunStatus.FAILED,
+            error_detail="Timed out: Command still running",
+        )
+
+        response = await async_client.post(
+            f"/api/automation/v1/runs/{run.id}/complete",
+            json={
+                "status": "COMPLETED",
+                "conversation_id": "conv-late-999",
+                "cost": 0.25,
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "COMPLETED"
+        assert data["error_detail"] is None
+
+        await async_session.refresh(run)
+        assert run.status == AutomationRunStatus.COMPLETED
+        assert run.error_detail is None
+        assert run.conversation_id == "conv-late-999"
+        assert run.cost == 0.25
+
+    async def test_complete_run_late_failure_does_not_reconcile(
+        self, async_client, async_session
+    ):
+        """Only proof of success reconciles; a late FAILED callback still 409s."""
+        from openhands.automation.models import AutomationRunStatus
+
+        run = await self._terminal_run(
+            async_session,
+            AutomationRunStatus.FAILED,
+            error_detail="Timed out: Command still running",
+        )
+
+        response = await async_client.post(
+            f"/api/automation/v1/runs/{run.id}/complete",
+            json={"status": "FAILED", "error": "wrapper crashed"},
+        )
+
+        assert response.status_code == 409
+        await async_session.refresh(run)
+        assert run.status == AutomationRunStatus.FAILED
+        assert run.error_detail == "Timed out: Command still running"
+
+    async def test_complete_run_does_not_reconcile_dispatcher_failure(
+        self, async_client, async_session
+    ):
+        """FAILED states not authored by the watchdog keep their 409."""
+        from openhands.automation.models import AutomationRunStatus
+
+        run = await self._terminal_run(
+            async_session,
+            AutomationRunStatus.FAILED,
+            error_detail="Internal error",
+        )
+
+        response = await async_client.post(
+            f"/api/automation/v1/runs/{run.id}/complete",
+            json={"status": "COMPLETED"},
+        )
+
+        assert response.status_code == 409
+        await async_session.refresh(run)
+        assert run.status == AutomationRunStatus.FAILED
+        assert run.error_detail == "Internal error"
+
+    async def test_complete_run_does_not_reconcile_cancelled_run(
+        self, async_client, async_session
+    ):
+        """A cancelled run stays cancelled even if a success callback arrives."""
+        from openhands.automation.models import AutomationRunStatus
+
+        run = await self._terminal_run(async_session, AutomationRunStatus.CANCELLED)
+
+        response = await async_client.post(
+            f"/api/automation/v1/runs/{run.id}/complete",
+            json={"status": "COMPLETED"},
+        )
+
+        assert response.status_code == 409
+        assert "CANCELLED" in response.json()["detail"]
+        await async_session.refresh(run)
+        assert run.status == AutomationRunStatus.CANCELLED
+
+    async def test_first_completed_run_records_success_outcome(
+        self, async_client, async_session
+    ):
+        """The first completed run stamps a one-time success outcome."""
+        automation, run = await self._seed_running_run(
+            async_session,
+            {
+                "preset_type": "prompt",
+                "prompt": "p",
+                "template": {"id": "tpl", "version": "1.2.0"},
+            },
+        )
+
+        response = await async_client.post(
+            f"/api/automation/v1/runs/{run.id}/complete",
+            json={"status": "COMPLETED"},
+        )
+
+        assert response.status_code == 200
+        await async_session.refresh(automation)
+        metadata = automation.preset_metadata
+        assert metadata is not None
+        first_run = metadata["first_run"]
+        assert first_run["status"] == "success"
+        assert first_run["failure_stage"] is None
+        assert first_run["template_version"] == "1.2.0"
+        assert first_run["recorded_at"]
+
+    async def test_first_failed_run_records_execution_failure_stage(
+        self, async_client, async_session
+    ):
+        """A first-run failure records the stage, and nothing sensitive."""
+        automation, run = await self._seed_running_run(
+            async_session,
+            {
+                "preset_type": "prompt",
+                "prompt": "p",
+                "template": {"id": "tpl", "version": "1.2.0"},
+            },
+        )
+
+        response = await async_client.post(
+            f"/api/automation/v1/runs/{run.id}/complete",
+            json={"status": "FAILED", "error": "secret stack trace"},
+        )
+
+        assert response.status_code == 200
+        await async_session.refresh(automation)
+        metadata = automation.preset_metadata
+        assert metadata is not None
+        first_run = metadata["first_run"]
+        assert first_run["status"] == "failure"
+        assert first_run["failure_stage"] == "execution"
+        # The record carries no error text or prompt by construction.
+        assert set(first_run) == {
+            "status",
+            "failure_stage",
+            "template_version",
+            "recorded_at",
+        }
+
+    async def test_first_run_outcome_is_not_overwritten_by_later_runs(
+        self, async_client, async_session
+    ):
+        """Only the first terminal run records; later outcomes leave it alone."""
+        from openhands.automation.models import AutomationRun, AutomationRunStatus
+
+        automation, run = await self._seed_running_run(
+            async_session,
+            {
+                "preset_type": "prompt",
+                "prompt": "p",
+                "template": {"id": "tpl", "version": "1.2.0"},
+            },
+        )
+        first = await async_client.post(
+            f"/api/automation/v1/runs/{run.id}/complete",
+            json={"status": "FAILED", "error": "boom"},
+        )
+        assert first.status_code == 200
+        second_run = AutomationRun(
+            automation_id=automation.id,
+            status=AutomationRunStatus.RUNNING,
+        )
+        async_session.add(second_run)
+        await async_session.commit()
+
+        second = await async_client.post(
+            f"/api/automation/v1/runs/{second_run.id}/complete",
+            json={"status": "COMPLETED"},
+        )
+
+        assert second.status_code == 200
+        await async_session.refresh(automation)
+        metadata = automation.preset_metadata
+        assert metadata is not None
+        assert metadata["first_run"]["status"] == "failure"
+
+    async def test_run_completion_without_template_records_no_outcome(
+        self, async_client, async_session
+    ):
+        """Automations without template provenance never record a first run."""
+        automation, run = await self._seed_running_run(
+            async_session,
+            {"preset_type": "prompt", "prompt": "p"},
+        )
+
+        response = await async_client.post(
+            f"/api/automation/v1/runs/{run.id}/complete",
+            json={"status": "COMPLETED"},
+        )
+
+        assert response.status_code == 200
+        await async_session.refresh(automation)
+        metadata = automation.preset_metadata
+        assert metadata is not None
+        assert "first_run" not in metadata
+
+
+class TestReportRunPhase:
+    """Tests for POST /runs/{run_id}/phase endpoint."""
+
+    async def _seed_run(self, async_session, status, *, user_id=None, org_id=None):
+        """Create an automation + run in the given status; returns the run."""
+        from openhands.automation.models import AutomationRunStatus
+
+        automation = Automation(
+            user_id=user_id or TEST_USER_ID,
+            org_id=org_id or TEST_ORG_ID,
+            name="Phase Test Automation",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://bucket/code.tar.gz",
+            entrypoint="uv run script.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        run = AutomationRun(
+            automation_id=automation.id,
+            status=AutomationRunStatus(status),
+        )
+        async_session.add(run)
+        await async_session.commit()
+        return run
+
+    async def test_report_phase_updates_in_flight_run(
+        self, async_client, async_session
+    ):
+        """A phase posted while the run is RUNNING is stored and returned."""
+        run = await self._seed_run(async_session, "RUNNING")
+
+        response = await async_client.post(
+            f"/api/automation/v1/runs/{run.id}/phase",
+            json={"phase": "Cloning repositories"},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["current_phase"] == "Cloning repositories"
+        await async_session.refresh(run)
+        assert run.current_phase == "Cloning repositories"
+
+    async def test_report_phase_returns_409_for_terminal_run(
+        self, async_client, async_session
+    ):
+        """A phase posted after the run reached a terminal state is rejected."""
+        run = await self._seed_run(async_session, "COMPLETED")
+
+        response = await async_client.post(
+            f"/api/automation/v1/runs/{run.id}/phase",
+            json={"phase": "Too late"},
+        )
+
+        assert response.status_code == 409
+        await async_session.refresh(run)
+        assert run.current_phase is None
+
+    async def test_report_phase_normalizes_control_characters_and_whitespace(
+        self, async_client, async_session
+    ):
+        """Control chars/newlines and whitespace runs collapse to single spaces."""
+        run = await self._seed_run(async_session, "RUNNING")
+
+        response = await async_client.post(
+            f"/api/automation/v1/runs/{run.id}/phase",
+            json={"phase": " Checking\nout\tPR   #123 "},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["current_phase"] == "Checking out PR #123"
+
+    async def test_report_phase_rejects_blank_phase(self, async_client, async_session):
+        """A phase that is empty after normalization fails validation."""
+        run = await self._seed_run(async_session, "RUNNING")
+
+        response = await async_client.post(
+            f"/api/automation/v1/runs/{run.id}/phase",
+            json={"phase": " \n\t "},
+        )
+
+        assert response.status_code == 422
+
+    async def test_report_phase_for_unknown_run_returns_404(self, async_client):
+        """Reporting a phase on a run that does not exist returns 404."""
+        response = await async_client.post(
+            f"/api/automation/v1/runs/{uuid.uuid4()}/phase",
+            json={"phase": "Ghost"},
+        )
+
+        assert response.status_code == 404
+
+    async def test_report_phase_for_other_users_run_returns_403(
+        self, async_client, async_session
+    ):
+        """Reporting a phase on another user's run is forbidden."""
+        run = await self._seed_run(
+            async_session, "RUNNING", user_id=OTHER_USER_ID, org_id=OTHER_ORG_ID
+        )
+
+        response = await async_client.post(
+            f"/api/automation/v1/runs/{run.id}/phase",
+            json={"phase": "Sneaky"},
+        )
+
+        assert response.status_code == 403
+
+    async def test_last_phase_is_preserved_after_completion(
+        self, async_client, async_session
+    ):
+        """Completion keeps the last reported phase (unlike status_detail)."""
+        run = await self._seed_run(async_session, "RUNNING")
+        await async_client.post(
+            f"/api/automation/v1/runs/{run.id}/phase",
+            json={"phase": "Running QA checks"},
+        )
+
+        response = await async_client.post(
+            f"/api/automation/v1/runs/{run.id}/complete",
+            json={"status": "COMPLETED"},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["current_phase"] == "Running QA checks"
+        await async_session.refresh(run)
+        assert run.current_phase == "Running QA checks"
+
+
+class TestDownloadTarball:
+    """Tests for GET /{automation_id}/tarball endpoint."""
+
+    async def test_internal_url_returns_tarball_bytes(
+        self, async_client, async_session
+    ):
+        """Tarball bytes are returned for a completed internal upload."""
+        from unittest.mock import MagicMock
+
+        from openhands.automation.app import app
+        from openhands.automation.models import TarballUpload, UploadStatus
+        from openhands.automation.storage import get_file_store
+
+        upload = TarballUpload(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="test-tarball",
+            status=UploadStatus.COMPLETED,
+            storage_path=f"uploads/{TEST_ORG_ID}/{TEST_USER_ID}/upload.tar",
+        )
+        async_session.add(upload)
+        await async_session.commit()
+
+        tarball_bytes = b"fake tarball content"
+        mock_store = MagicMock()
+        mock_store.read.return_value = tarball_bytes
+        app.dependency_overrides[get_file_store] = lambda: mock_store
+
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="My Automation",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path=f"oh-internal://uploads/{upload.id}",
+            entrypoint="uv run script.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        response = await async_client.get(f"/api/automation/v1/{automation.id}/tarball")
+
+        assert response.status_code == 200
+        assert response.content == tarball_bytes
+        assert response.headers["content-type"] == "application/x-tar"
+        assert 'filename="My Automation.tar"' in response.headers["content-disposition"]
+        mock_store.read.assert_called_once_with(upload.storage_path)
+
+    async def test_internal_url_upload_deleted_returns_404(
+        self, async_client, async_session
+    ):
+        """404 is returned when the referenced internal upload has been soft-deleted."""
+        from unittest.mock import MagicMock
+
+        from openhands.automation.app import app
+        from openhands.automation.models import TarballUpload, UploadStatus
+        from openhands.automation.storage import get_file_store
+
+        upload = TarballUpload(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="deleted-upload",
+            status=UploadStatus.COMPLETED,
+            storage_path="uploads/test/deleted.tar",
+            deleted_at=utcnow(),
+        )
+        async_session.add(upload)
+        await async_session.commit()
+
+        app.dependency_overrides[get_file_store] = lambda: MagicMock()
+
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="My Automation",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path=f"oh-internal://uploads/{upload.id}",
+            entrypoint="uv run script.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        response = await async_client.get(f"/api/automation/v1/{automation.id}/tarball")
+
+        assert response.status_code == 404
+        assert "deleted" in response.json()["detail"].lower()
+
+    async def test_internal_url_file_missing_from_storage_returns_404(
+        self, async_client, async_session
+    ):
+        """404 is returned when the file is missing from the storage backend."""
+        from unittest.mock import MagicMock
+
+        from openhands.automation.app import app
+        from openhands.automation.models import TarballUpload, UploadStatus
+        from openhands.automation.storage import get_file_store
+
+        upload = TarballUpload(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="missing-file",
+            status=UploadStatus.COMPLETED,
+            storage_path="uploads/test/missing.tar",
+        )
+        async_session.add(upload)
+        await async_session.commit()
+
+        mock_store = MagicMock()
+        mock_store.read.side_effect = FileNotFoundError("file not found")
+        app.dependency_overrides[get_file_store] = lambda: mock_store
+
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="My Automation",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path=f"oh-internal://uploads/{upload.id}",
+            entrypoint="uv run script.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        response = await async_client.get(f"/api/automation/v1/{automation.id}/tarball")
+
+        assert response.status_code == 404
+        assert "not found in storage" in response.json()["detail"]
+
+    async def test_https_url_returns_redirect(self, async_client, async_session):
+        """302 redirect is returned for an https:// tarball URL."""
+        from unittest.mock import MagicMock
+
+        from openhands.automation.app import app
+        from openhands.automation.storage import get_file_store
+
+        app.dependency_overrides[get_file_store] = lambda: MagicMock()
+
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="External Automation",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="https://example.com/tarball.tar.gz",
+            entrypoint="uv run script.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        response = await async_client.get(
+            f"/api/automation/v1/{automation.id}/tarball",
+            follow_redirects=False,
+        )
+
+        assert response.status_code == 302
+        assert response.headers["location"] == "https://example.com/tarball.tar.gz"
+
+    async def test_s3_url_returns_422(self, async_client, async_session):
+        """422 is returned for an s3:// tarball URL that cannot be proxied."""
+        from unittest.mock import MagicMock
+
+        from openhands.automation.app import app
+        from openhands.automation.storage import get_file_store
+
+        app.dependency_overrides[get_file_store] = lambda: MagicMock()
+
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="S3 Automation",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="s3://my-bucket/code.tar.gz",
+            entrypoint="uv run script.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        response = await async_client.get(f"/api/automation/v1/{automation.id}/tarball")
+
+        assert response.status_code == 422
+        assert "s3" in response.json()["detail"]
+
+    async def test_automation_not_found_returns_404(self, async_client):
+        """404 is returned for an unknown automation ID."""
+        from unittest.mock import MagicMock
+
+        from openhands.automation.app import app
+        from openhands.automation.storage import get_file_store
+
+        app.dependency_overrides[get_file_store] = lambda: MagicMock()
+
+        response = await async_client.get(f"/api/automation/v1/{uuid.uuid4()}/tarball")
+
+        assert response.status_code == 404
+
+    async def test_http_url_returns_redirect(self, async_client, async_session):
+        """302 redirect is returned for an http:// tarball URL."""
+        from unittest.mock import MagicMock
+
+        from openhands.automation.app import app
+        from openhands.automation.storage import get_file_store
+
+        app.dependency_overrides[get_file_store] = lambda: MagicMock()
+
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="HTTP External Automation",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path="http://example.com/tarball.tar.gz",
+            entrypoint="uv run script.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        response = await async_client.get(
+            f"/api/automation/v1/{automation.id}/tarball",
+            follow_redirects=False,
+        )
+
+        assert response.status_code == 302
+        assert response.headers["location"] == "http://example.com/tarball.tar.gz"
+
+    async def test_internal_url_sanitizes_filename(self, async_client, async_session):
+        """Control characters and path separators in automation name are stripped."""
+        from unittest.mock import MagicMock
+
+        from openhands.automation.app import app
+        from openhands.automation.models import TarballUpload, UploadStatus
+        from openhands.automation.storage import get_file_store
+
+        upload = TarballUpload(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="test-tarball",
+            status=UploadStatus.COMPLETED,
+            storage_path=f"uploads/{TEST_ORG_ID}/{TEST_USER_ID}/upload.tar",
+        )
+        async_session.add(upload)
+        await async_session.commit()
+
+        mock_store = MagicMock()
+        mock_store.read.return_value = b"fake tarball"
+        app.dependency_overrides[get_file_store] = lambda: mock_store
+
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name='My"Auto/mation\nName',
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path=f"oh-internal://uploads/{upload.id}",
+            entrypoint="uv run script.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        response = await async_client.get(f"/api/automation/v1/{automation.id}/tarball")
+
+        assert response.status_code == 200
+        disposition = response.headers["content-disposition"]
+        # Extract just the filename value (between the wrapper quotes)
+        filename = disposition.split('filename="')[1].rstrip('"')
+        assert "\n" not in filename
+        assert "\r" not in filename
+        assert '"' not in filename
+        assert "/" not in filename
+
+    async def test_internal_url_storage_error_returns_500(
+        self, async_client, async_session
+    ):
+        """500 is returned when the storage backend raises an unexpected error."""
+        from unittest.mock import MagicMock
+
+        from openhands.automation.app import app
+        from openhands.automation.models import TarballUpload, UploadStatus
+        from openhands.automation.storage import get_file_store
+
+        upload = TarballUpload(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="error-upload",
+            status=UploadStatus.COMPLETED,
+            storage_path="uploads/test/error.tar",
+        )
+        async_session.add(upload)
+        await async_session.commit()
+
+        mock_store = MagicMock()
+        mock_store.read.side_effect = OSError("disk full")
+        app.dependency_overrides[get_file_store] = lambda: mock_store
+
+        automation = Automation(
+            user_id=TEST_USER_ID,
+            org_id=TEST_ORG_ID,
+            name="My Automation",
+            trigger={"type": "cron", "schedule": "0 9 * * *", "timezone": "UTC"},
+            tarball_path=f"oh-internal://uploads/{upload.id}",
+            entrypoint="uv run script.py",
+        )
+        async_session.add(automation)
+        await async_session.commit()
+
+        response = await async_client.get(f"/api/automation/v1/{automation.id}/tarball")
+
+        assert response.status_code == 500
+        assert "retrieve" in response.json()["detail"].lower()
