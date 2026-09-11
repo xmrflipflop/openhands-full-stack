@@ -15,6 +15,9 @@
 # uv-managed Python virtual environments created under the SDK package.
 /packages/software-agent-sdk/.venv/
 
+# uv-managed Python virtual environment created for the automation package.
+/packages/automation/.venv/
+
 # Frontend dependencies installed by the launcher (packages carries its own
 # upstream .gitignore; this is a belt-and-braces workspace guard).
 /node_modules/

@@ -6,9 +6,11 @@
 
 A thin workspace-owned entry shim so the production frontend app starts correctly under PM2 fork mode. Upstream `packages/OpenHands/scripts/static-server.mjs` guards its entry behind an `isMainModule` check that passes when run directly with `node` but fails when PM2 forks the script — the process comes up `online` under PM2 but binds no port and prints no banner.
 
-This wrapper imports the upstream script's exported `parseArgs` and `startStaticServer` functions and calls them directly, bypassing the guard. The arguments, environment, and behaviour are identical to a direct `node` invocation; only the entry mechanism differs.
+This wrapper imports the upstream script's exported `parseArgs` and `startStaticServer` functions and calls them directly, bypassing the guard. The arguments, environment, and behaviour are otherwise identical to a direct `node` invocation.
 
-If upstream ever drops the `isMainModule` guard (or exports a dedicated `main`), this wrapper can be retired and the ecosystem pointed back at the upstream script directly.
+It also performs one extra step: it merges the launcher-resolved `runtime_services` block (passed as the `FRONTEND_RUNTIME_SERVICES_INFO` env var) into the config's `runtimeServicesInfo` before starting the server, so the production static server advertises the local services in `/server_info` exactly like the development ingress does (PRD 1 FR22a). The value is supplied by env rather than a `--runtime-services-info` flag because the JSON contains spaces and PM2 shell-joins a string `args` field, which would corrupt it.
+
+If upstream ever drops the `isMainModule` guard (or exports a dedicated `main`) and gains an env path for `runtimeServicesInfo`, this wrapper can be retired and the ecosystem pointed back at the upstream script directly.
 
 ## Scope
 
@@ -16,7 +18,7 @@ Workspace-owned; no upstream files are modified.
 
 | Path | Role |
 | --- | --- |
-| `scripts/prod-frontend-server.mjs` | The wrapper (workspace-owned). Imports `parseArgs` + `startStaticServer` from upstream and runs them unconditionally. |
+| `scripts/prod-frontend-server.mjs` | The wrapper (workspace-owned). Imports `parseArgs` + `startStaticServer` from upstream and runs them unconditionally; before starting, merges the `FRONTEND_RUNTIME_SERVICES_INFO` env var into the config's `runtimeServicesInfo` when the flag was not set (FR4). |
 | `packages/OpenHands/scripts/static-server.mjs` | Consumed upstream: the static file server + reverse proxy whose entry is guarded by `isMainModule`. Exports `parseArgs()` and `startStaticServer()` for programmatic use. |
 | `ecosystem.config.js` | Points PM2 at the wrapper instead of the upstream script for the production frontend app (`script: PROD_FRONTEND_SCRIPT`). |
 
@@ -36,11 +38,12 @@ This idiom is correct for `node scripts/static-server.mjs` — `process.argv[1]`
 - **FR1** — The wrapper imports `parseArgs` and `startStaticServer` from the upstream static-server script and calls them in sequence, passing through all CLI arguments and environment variables unchanged.
 - **FR2** — The wrapper is the sole entry point for the production frontend PM2 app; the ecosystem.config.js production frontend `script` field resolves to `scripts/prod-frontend-server.mjs`, not the upstream script.
 - **FR3** — The wrapper exits non-zero if upstream parsing or server startup throws, so PM2 treats it as a crash (not a silent no-op).
+- **FR4** — When the upstream `parseArgs()` does not already yield a `runtimeServicesInfo` (i.e. no `--runtime-services-info` flag was passed) but the `FRONTEND_RUNTIME_SERVICES_INFO` env var is set, the wrapper sets `config.runtimeServicesInfo` from that env value before calling `startStaticServer`, so the production static server appends `runtime_services` to `/server_info` (PRD 1 FR22a) and injects the legacy window global into `index.html`. A flag-provided value always wins over the env value.
 
 ## Non-functional requirements
 
 - **NFR1** — No upstream code is modified; the wrapper is purely additive.
-- **NFR2** — The wrapper contains no routing, proxying, or serving logic; it merely calls upstream exported functions.
+- **NFR2** — The wrapper contains no routing, proxying, or serving logic; it only shims the entry point (the unconditional `parseArgs` + `startStaticServer` calls) and the one-value `runtimeServicesInfo` merge (FR4).
 
 ## Decision points
 
@@ -56,11 +59,11 @@ This idiom is correct for `node scripts/static-server.mjs` — `process.argv[1]`
 
 ## Upstream divergence
 
-Behavioural only; no upstream code is modified. The divergence exists solely because upstream's self-detection idiom is incompatible with PM2 fork mode. A `main()` export (or `module` field in upstream `package.json`) would be a reasonable upstream contribution and would retire this wrapper.
+Behavioural only; no upstream code is modified. The primary divergence exists because upstream's self-detection idiom is incompatible with PM2 fork mode; a `main()` export (or `module` field in upstream `package.json`) would be a reasonable upstream contribution and would retire that part of the wrapper. The runtime-services env merge (FR4) exists because the upstream script accepts `runtimeServicesInfo` only via a `--runtime-services-info` flag, and a JSON-with-spaces value must not be passed as a PM2 shell-joined `args` string; an env path for `runtimeServicesInfo` on the upstream script would retire that part of the wrapper too.
 
 ## Conflict resolution notes
 
-Preserve the requirement, not the implementation. If upstream adds a `main` export, retire the wrapper and point the ecosystem at the upstream script directly. If upstream renames or removes the `parseArgs` / `startStaticServer` exports, re-locate the current programmatic entry surface and rewire the wrapper's imports — the unconditional entry is the only stable workspace concern.
+Preserve the requirement, not the implementation. If upstream adds a `main` export, retire the entry shim and point the ecosystem at the upstream script directly (keeping the env merge if upstream still lacks a runtime-services env path). If upstream renames or removes the `parseArgs` / `startStaticServer` exports, re-locate the current programmatic entry surface and rewire the wrapper's imports. The two stable workspace concerns are the unconditional entry and the `runtimeServicesInfo` env merge (FR4).
 
 ## Status
 

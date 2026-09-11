@@ -1,15 +1,16 @@
 # OpenHands Full Stack Workspace
 
-An integration repository for developing and running OpenHands Agent Canvas alongside the OpenHands Software Agent SDK.
+An integration repository for developing and running OpenHands Agent Canvas alongside the OpenHands Software Agent SDK and the OpenHands Automation service.
 
-This repository uses **Git subtrees**. Both upstream projects are committed as ordinary directories in this repository, so a regular clone includes their full source code. No submodule initialisation is required.
+This repository uses **Git subtrees**. All upstream projects are committed as ordinary directories in this repository, so a regular clone includes their full source code. No submodule initialisation is required.
 
 ## Included packages
 
 | Local path | Canonical upstream | Role |
 | --- | --- | --- |
 | `packages/OpenHands` | [OpenHands/OpenHands](https://github.com/OpenHands/OpenHands) | Self-hostable Agent Canvas application (the monorepo's frontend root) |
-| `packages/software-agent-sdk` | [OpenHands/software-agent-sdk](https://github.com/OpenHands/software-agent-sdk) | Modular SDK for building software agents |
+| `packages/software-agent-sdk` | [OpenHands/software-agent-sdk](https://github.com/OpenHands/software-agent-sdk) | Modular SDK for building software agents (includes the Agent Server backend) |
+| `packages/automation` | [OpenHands/automation](https://github.com/OpenHands/automation) | OpenHands Automation service (cron/webhook-triggered automation runs) |
 
 ## Layout
 
@@ -22,7 +23,8 @@ This repository uses **Git subtrees**. Both upstream projects are committed as o
 │   └── workflows/                 # Workspace CI/CD workflows
 ├── packages/
 │   ├── OpenHands/              # Git subtree: OpenHands/OpenHands (frontend root)
-│   └── software-agent-sdk/        # Git subtree: OpenHands/software-agent-sdk
+│   ├── software-agent-sdk/        # Git subtree: OpenHands/software-agent-sdk
+│   └── automation/                # Git subtree: OpenHands/automation
 ├── docker/
 │   ├── Dockerfile                 # Optional combined workspace image
 │   └── compose.yaml               # Optional combined local-service configuration
@@ -54,8 +56,8 @@ Key points:
 - Every checkout — production included — needs a `.dev-id` file (gitignored) holding a unique positive integer. `just setup` allocates one automatically (idempotent). The id embeds in the tag and the port block for both modes.
 - The stack has two **independent** axes. **Mode** (`--production` or not) selects `NODE_ENV` and the frontend serving seam. **Run style** (`--background` or not) selects foreground `pm2-runtime` (default) vs. detached `pm2` against the shared daemon. All four combinations are legal.
 - Tag shape is `dev-<id>` or `prod-<id>`, used verbatim as the PM2 app-name suffix and namespace (e.g. `backend-dev-1`, `frontend-prod-2`). This is a breaking rename from the earlier `dev1` / `prod` shape.
-- Default ports (bases 3000 / 18000 / 9000 for frontend / backend / ingress) are `base + id×10`, plus 5 for production (so a dev and a prod of the same id never collide). Each of the six ports defaults independently; pass `--fe_port` / `--be_port` / `--ingress_port` to override.
-- Bind addresses default to loopback (`127.0.0.1`) for every service. Loopback is a security property, not a convenience: the stack is unauthenticated by default, so exposing it must stay opt-in and explicit. Override via the `--fe_bind` / `--be_bind` / `--ingress_bind` flags, or the legacy `DEV_FRONTEND_BIND` / `DEV_BACKEND_BIND` / `DEV_INGRESS_BIND` env vars (kept for continuity with existing shell profiles).
+- Default ports (bases 3000 / 18000 / 18100 / 9000 for frontend / backend / automation / ingress) are `base + id×10`, plus 5 for production (so a dev and a prod of the same id never collide). Each of the eight ports defaults independently; pass `--fe_port` / `--be_port` / `--automation_port` / `--ingress_port` to override.
+- Bind addresses default to loopback (`127.0.0.1`) for every service. Loopback is a security property, not a convenience: the stack is unauthenticated by default, so exposing it must stay opt-in and explicit. Override via the `--fe_bind` / `--be_bind` / `--automation_bind` / `--ingress_bind` flags, or the legacy `DEV_*_BIND` env vars (kept for continuity with existing shell profiles).
 - The frontend is served differently per **mode**: development runs the Vite dev server (`react-router dev`); production serves a prebuilt bundle through the upstream static file server. The split exists because the Vite dev server cannot run under `NODE_ENV=production` (Vite's SSR JSX transform then imports a runtime that has no `jsxDEV` export, crashing the dev server). Production requires the bundle to be built first via `just setup --production`; the launcher (and the ecosystem, as a backstop) fail fast with a clear message if it is missing.
 
 | Service | dev-1 | prod-1 | Purpose |
@@ -63,6 +65,7 @@ Key points:
 | Stack (ingress) | `:9010` | `:9015` | Single-origin entry point — browse here |
 | Frontend | `:3010` (Vite dev server) | `:3015` (static server + built SPA) | Direct frontend port, for debugging |
 | Backend (agent-server) | `:18010` | `:18015` | Direct API port, for debugging (`/docs`) |
+| Automation | `:18110` | `:18115` | Automation service API, for debugging (`/api/automation/health`) |
 
 ### Environment variables and secrets
 
@@ -97,12 +100,12 @@ Fernet(key).decrypt(token)
 
 ```bash
 just setup            # alloc .dev-id + uv sync + npm install; in dev mode also configures upstream git remotes (once per checkout)
-just serve            # foreground: backend + frontend + ingress, logs stream, Ctrl-C stops all
+just serve            # foreground: backend + automation + frontend + ingress, logs stream, Ctrl-C stops all
 ```
 
 `just serve` runs the launcher, which starts `pm2-runtime` in the foreground against a throwaway `PM2_HOME` keyed on the tag (`/tmp/pm2-fg-<tag>`), so the foreground run never touches the global `~/.pm2` daemon. Logs stream to the terminal; Ctrl-C stops the whole stack; there is no state to manage, save, or resurrect. To reach a service from another machine, pass the bind flag, e.g. `just serve --ingress_bind 0.0.0.0`.
 
-The OpenHands Automation backend is not part of this repository and is not started.
+The OpenHands Automation service is part of this repository (`packages/automation`) and is started with the stack. It runs in local mode against this checkout's agent-server, serves its API under `/api/automation` on the ingress origin (e.g. `http://localhost:9010/api/automation/v1`), and keeps its state (SQLite DB, uploaded tarballs, per-run workspaces) under `<workspace_dir>/automation/`. Browser and API clients authenticate with the shared session key (`X-Session-API-Key`).
 
 ### Background / production
 
@@ -131,8 +134,8 @@ Snapshot/restore (`pm2 save` / `pm2 resurrect`) is intentionally **not** support
 
 | Flag | Effect |
 | --- | --- |
-| `--fe_port` / `--be_port` / `--ingress_port` | Override one of the three ports (default each computes from the id). Out of 1024–65535 or non-integer is a hard error. |
-| `--fe_bind` / `--be_bind` / `--ingress_bind` | Override one of the three bind addresses (default loopback; then `DEV_*_BIND` env). |
+| `--fe_port` / `--be_port` / `--automation_port` / `--ingress_port` | Override one of the four ports (default each computes from the id). Out of 1024–65535 or non-integer is a hard error. |
+| `--fe_bind` / `--be_bind` / `--automation_bind` / `--ingress_bind` | Override one of the four bind addresses (default loopback; then `DEV_*_BIND` env). |
 | `--background` | Detach: `pm2 start` against the shared daemon (default is foreground `pm2-runtime`). |
 | `--production` | `NODE_ENV=production`, serve the prebuilt SPA, require the build to exist. |
 | `--dry-run` | Print the resolved env and intended runner; start nothing. |
@@ -145,13 +148,13 @@ Run `just` with no arguments to list all recipes. The common ones:
 ```bash
 just setup           # bootstrap deps (alloc .dev-id, uv sync, npm install) — also runs just setup-remotes in dev mode — once per checkout
 just setup --production    # same, but builds the Agent Canvas production bundle (and skips the git-remote step — not needed to serve) — production mode only
-just serve           # start the local stack in the foreground (frontend + backend + ingress)
+just serve           # start the local stack in the foreground (frontend + backend + automation + ingress)
 just serve --background   # detach: leave the stack running on the shared daemon
 just lint            # workspace linters, incl. the PRD reference check
 just test            # workspace tests
 just check           # lint + test — run before pushing
 just setup-remotes   # set up the upstream git remotes (also run automatically by just setup in dev mode)
-just sync            # pull both upstream subtrees
+just sync            # pull all three upstream subtrees
 ```
 
 `just serve` forwards all flags to `scripts/launch-stack.js`, which resolves the per-checkout id, tag, ports, bind addresses, session key, and `NODE_ENV`, then hands them to `ecosystem.config.js`. The default foreground run uses `pm2-runtime` with a throwaway `PM2_HOME` keyed on the tag, so it never touches the global `~/.pm2` daemon; `--background` detaches against the shared daemon instead. Mode is independent of run style: `--production` selects `NODE_ENV=production` and serves a prebuilt bundle (`just setup --production` builds it), because the Vite dev server cannot run under `NODE_ENV=production`.
@@ -180,6 +183,9 @@ git remote add OpenHands \
 git remote add software-agent-sdk \
   https://github.com/OpenHands/software-agent-sdk.git
 
+git remote add automation \
+  https://github.com/OpenHands/automation.git
+
 git remote -v
 ```
 
@@ -188,9 +194,10 @@ git remote -v
 Pull updates from the OpenHands upstream repositories. `just sync` (and each `just sync-<pkg>`) resolves the `latest` ref to the upstream's most recent GitHub release tag and `git subtree merge`s that tag; pass an explicit `<ref>` for a specific release tag:
 
 ```bash
-just sync                   # both subtrees, at their latest release tag
+just sync                   # all three subtrees, at their latest release tag
 just sync-openhands <ref>   # only OpenHands frontend, at a specific tag (e.g. v1.8.0)
 just sync-sdk <ref>         # only the SDK, from a specific ref
+just sync-automation <ref>  # only the automation service, from a specific ref
 ```
 
 Under the hood they run the standard subtree pulls. The `OpenHands` fetch hits the OpenHands monorepo:
@@ -207,6 +214,12 @@ git fetch software-agent-sdk
 git subtree pull \
   --prefix=packages/software-agent-sdk \
   software-agent-sdk main
+
+# Update the automation service
+git fetch automation
+git subtree pull \
+  --prefix=packages/automation \
+  automation main
 ```
 
 If an upstream repository uses a branch other than `main`, pass its default branch as the ref.
@@ -215,7 +228,7 @@ After pulling, review, validate (`just check`), commit, and push the update:
 
 ```bash
 git status
-git add packages/OpenHands packages/software-agent-sdk
+git add packages/OpenHands packages/software-agent-sdk packages/automation
 git commit -m "chore: update OpenHands subtrees"
 git push origin main
 ```

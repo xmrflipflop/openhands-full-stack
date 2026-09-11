@@ -2,16 +2,18 @@
 
 ## Purpose
 
-This repository is an integration workspace for two canonical OpenHands projects, imported as Git subtrees.
+This repository is an integration workspace for three canonical OpenHands projects, imported as Git subtrees.
 
 | Local path | Canonical upstream | Git remote |
 | --- | --- | --- |
 | `packages/OpenHands` | `https://github.com/OpenHands/OpenHands.git` | `OpenHands` |
 | `packages/software-agent-sdk` | `https://github.com/OpenHands/software-agent-sdk.git` | `software-agent-sdk` |
+| `packages/automation` | `https://github.com/OpenHands/automation.git` | `automation` |
 
 - `packages/OpenHands` contains the self-hostable Agent Canvas application (the OpenHands monorepo frontend root).
 - `packages/software-agent-sdk` contains the shared Software Agent SDK.
-- This parent repository owns configuration and code that integrates both packages.
+- `packages/automation` contains the OpenHands Automation service (cron/webhook-triggered automation runs).
+- This parent repository owns configuration and code that integrates all three packages.
 
 ## Layout
 
@@ -24,7 +26,8 @@ This repository is an integration workspace for two canonical OpenHands projects
 │   └── workflows/                 # Workspace CI/CD workflows
 ├── packages/
 │   ├── OpenHands/              # Git subtree: OpenHands/OpenHands (frontend root)
-│   └── software-agent-sdk/        # Git subtree: OpenHands/software-agent-sdk
+│   ├── software-agent-sdk/        # Git subtree: OpenHands/software-agent-sdk
+│   └── automation/                # Git subtree: OpenHands/automation
 ├── docker/
 │   ├── Dockerfile                 # Optional combined workspace image
 │   └── compose.yaml               # Optional combined local-service configuration
@@ -41,10 +44,11 @@ This repository is an integration workspace for two canonical OpenHands projects
 | `justfile` | Workspace task entry points (`just`): wrappers over `scripts/` and workspace shortcuts |
 | `packages/OpenHands/` | Imported Git subtree from `OpenHands/OpenHands` (the monorepo's frontend root) |
 | `packages/software-agent-sdk/` | Imported Git subtree from `OpenHands/software-agent-sdk` |
+| `packages/automation/` | Imported Git subtree from `OpenHands/automation` (the Automation service) |
 | `docker/Dockerfile` | Workspace container image definition |
 | `docker/compose.yaml` | Workspace local-service orchestration |
 | `scripts/` | Repeatable development, CI, and maintenance commands |
-| `scripts/dev-local-ingress.mjs` | Workspace-owned single-origin ingress wrapper (the third PM2 app); adds a bind address to the upstream ingress (see `docs/prd/4_ingress-host-wrapper.md`) |
+| `scripts/dev-local-ingress.mjs` | Workspace-owned single-origin ingress wrapper (one of the four PM2 apps); adds a bind address to the upstream ingress and routes `/api/automation` to the automation service (see `docs/prd/4_ingress-host-wrapper.md`) |
 | `scripts/launch-stack.js` | The only supported entry point for the stack; resolves every deployment-specific value (id, tag, ports, binds, session key, `NODE_ENV`) and hands it to PM2 via the ecosystem (see `docs/prd/1_local-dev-launcher.md`) |
 | `ecosystem.config.js` | Committed PM2 process ecosystem; a pure consumer that derives nothing — it reads `STACK_*` env vars set by the launcher and hard-errors (naming the launcher) if any required value is absent |
 | `infra/` | Deployment and infrastructure configuration |
@@ -157,7 +161,7 @@ Workspace-level tasks are run with `just` (https://github.com/casey/just) from t
 - `just test` — workspace tests.
 - `just check` — `lint` + `test`; run before declaring work complete.
 - `just setup-remotes` — set up or repair the canonical upstream git remotes (idempotent).
-- `just sync` — pull both upstream subtrees from `main`. The private per-package recipes `sync-openhands` and `sync-sdk` are hidden from the listing but callable directly with an optional ref (e.g. `just sync-openhands feat/x`).
+- `just sync` — pull all three upstream subtrees from `main`. The private per-package recipes `sync-openhands`, `sync-sdk`, and `sync-automation` are hidden from the listing but callable directly with an optional ref (e.g. `just sync-openhands feat/x`).
 
 Rules for the justfile:
 
@@ -173,13 +177,14 @@ The full stack runs strictly from this repository's sources, supervised by **PM2
 - **`.dev-id` for every checkout.** Every checkout — production included — carries a `.dev-id` file (gitignored) holding a unique positive integer. The launcher validates it (never allocates); a missing or invalid `.dev-id` aborts the launch. Allocation is automated in `just setup` (see `docs/prd/5_devid-worktree-allocation.md`).
 - **Tag from mode + id.** The tag is `dev-<id>` or `prod-<id>`, used verbatim as the PM2 app-name suffix (`backend-dev-1`, `frontend-prod-2`, …) and the `namespace`. Mode comes from `--production`; the id always embeds.
 - **Mode is independent of environment; both axes are free.** Mode (`--production` or not) selects `NODE_ENV` and the frontend serving seam; run style (`--background` or not) selects foreground `pm2-runtime` vs. detached `pm2` against the shared daemon. All four combinations are legal. (Note the runner mapping: `pm2-runtime` is the **foreground** runner; `pm2 start` detaches.)
-- **Ports.** Default ports are `base + id×10`, plus 5 for production (bases 3000 / 18000 / 9000 for frontend / backend / ingress). The production offset moves prod off the round numbers so a dev and a prod of the same id never collide; the step (10) must stay larger than the offset (5). Each of the six ports defaults independently (`--fe_port` etc. override).
+- **Ports.** Default ports are `base + id×10`, plus 5 for production (bases 3000 / 18000 / 18100 / 9000 for frontend / backend / automation / ingress). The production offset moves prod off the round numbers so a dev and a prod of the same id never collide; the step (10) must stay larger than the offset (5). Each of the eight ports defaults independently (`--fe_port` etc. override).
 - **Backend** — the OpenHands Agent Server from `packages/software-agent-sdk`. PM2's `script` points at the venv's installed `agent-server` console script (`packages/software-agent-sdk/.venv/bin/agent-server`) with that venv's Python as `interpreter`. `uv sync` materialises the venv with workspace members in editable mode (workspace sources only; never `openhands-*` from PyPI).
-- **Frontend** — the Agent Canvas from `packages/OpenHands`. The serving seam keys off `NODE_ENV` (this is the only conditional the ecosystem contains, plus its production build preflight): development runs the Vite dev server (`dev:frontend`), proxying `/api` to the local backend via `VITE_BACKEND_HOST`; production serves the prebuilt bundle through the upstream static server (`--session-api-key` injects the resolved session key at runtime). The split exists because the Vite dev server cannot run under `NODE_ENV=production`.
-- **Ingress** — the whole stack behind one origin, routing API/websocket paths to the backend and everything else to the frontend, so the browser makes same-origin calls. Runs via `scripts/dev-local-ingress.mjs` (see `docs/prd/4_ingress-host-wrapper.md`), a thin wrapper that reuses the upstream proxy internals unmodified and adds only a bind address.
+- **Automation** — the OpenHands Automation service from `packages/automation`, run in local mode against this checkout's agent-server. PM2's `script` is the automation venv's `uvicorn` with the app module `openhands.automation.app:app` (`uv sync` in `packages/automation` materialises its own venv; the automation package pins its `openhands-sdk` from PyPI, so it keeps a separate venv from the agent-server). It serves its API at `/api/automation` (the ingress routes that prefix to it, everything else under `/api` goes to the backend), keeps its state (SQLite DB, uploaded tarballs, per-run workspaces) under `<workspace_dir>/automation/`, and authenticates clients with the shared session key. The agent-server also gets `OPENHANDS_AUTOMATION_API_KEY` so agent shells can call the automation API the same way upstream's agent-canvas launcher does.
+- **Frontend** — the Agent Canvas from `packages/OpenHands`. The serving seam keys off `NODE_ENV` (this is the only conditional the ecosystem contains, plus its production build preflight): development runs the Vite dev server (`dev:frontend`), proxying `/api` to the local stack via `VITE_BACKEND_HOST` (pointed at the ingress origin, so `/api/automation` reaches the automation service and the rest of `/api` the backend); production serves the prebuilt bundle through the upstream static server (`--session-api-key` injects the resolved session key at runtime). The split exists because the Vite dev server cannot run under `NODE_ENV=production`.
+- **Ingress** — the whole stack behind one origin, routing `/api/automation` to the automation service, API/websocket paths to the backend, and everything else to the frontend, so the browser makes same-origin calls. Runs via `scripts/dev-local-ingress.mjs` (see `docs/prd/4_ingress-host-wrapper.md`), a thin wrapper that reuses the upstream proxy internals unmodified and adds only a bind address.
 - **Binds** — launcher-owned, one per service, defaulting to loopback (`127.0.0.1`). Loopback is a security property (the stack is unauthenticated by default), so exposing it stays opt-in and explicit: flag, then the legacy `DEV_<service>_BIND` env (kept for continuity), then loopback. The ecosystem no longer reads `DEV_*_BIND` and applies no default of its own.
 
-PM2 supervises each service with bounded auto-restart (`max_restarts`, `min_uptime`, `restart_delay`, `kill_timeout`) and a `max_memory_restart` threshold. `NODE_ENV` comes from `--production` (defaults to development) and is set on all three apps. The stack runs unprivileged; it binds no port below 1024 and writes only to workspace-owned, gitignored trees.
+PM2 supervises each service with bounded auto-restart (`max_restarts`, `min_uptime`, `restart_delay`, `kill_timeout`) and a `max_memory_restart` threshold. `NODE_ENV` comes from `--production` (defaults to development) and is set on all four apps. The stack runs unprivileged; it binds no port below 1024 and writes only to workspace-owned, gitignored trees.
 
 ```sh
 just setup                             # uv sync + npm install (once per checkout)
@@ -188,7 +193,7 @@ just serve                             # foreground: pm2-runtime + throwaway PM2
 
 `just serve` runs the launcher, which starts the stack in the foreground via `pm2-runtime` against a throwaway `PM2_HOME` keyed on the tag (`/tmp/pm2-fg-<tag>`), so the foreground run never touches the global `~/.pm2` daemon. Logs stream to the terminal; Ctrl-C stops the whole stack; there is no state to manage, save, or resurrect. `--background` detaches against the shared daemon instead. Snapshot/restore (`pm2 save` / `pm2 resurrect`) is intentionally **not** supported: a restored snapshot would replay stale resolved values and persist the session key to disk; restart by re-running `just serve`.
 
-Unlike upstream, the stack never fetches the agent-server via `uvx` from PyPI and never installs the published `@openhands/agent-canvas` package. The OpenHands Automation backend is intentionally not started: that project is not vendored in this repository. Do not "fix" the stack by pointing it at upstream releases; it exists to exercise the local subtrees.
+Unlike upstream, the stack never fetches the agent-server or the automation service from PyPI and never installs the published `@openhands/agent-canvas` package: it runs every service from the vendored subtree sources, including the OpenHands Automation service in `packages/automation` (see the Automation bullet above). Do not "fix" the stack by pointing it at upstream releases; it exists to exercise the local subtrees.
 
 The launcher's requirements live in `docs/prd/1_local-dev-launcher.md`, which also serves as the reference example of the PRD format described in Modular and additive changes. The ingress wrapper is justified in `docs/prd/4_ingress-host-wrapper.md`.
 
